@@ -15,7 +15,6 @@ def _():
     pull_btn = mo.ui.run_button(label="Pull from Git")
 
     mo.vstack([commit_message, mo.hstack([push_btn, pull_btn])])
-
     return commit_message, mo, os, pull_btn, push_btn, subprocess
 
 
@@ -125,6 +124,15 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
             output = pull_out
 
     mo.md(f"```text\n{output}\n```") if output else None
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # CITS4012 Project
+    *Etienne Vinton Horn, Tobias Camille*
+    """)
     return
 
 
