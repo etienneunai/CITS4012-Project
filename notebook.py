@@ -15,10 +15,11 @@ def _():
     pull_btn = mo.ui.run_button(label="Pull from Git")
 
     mo.vstack([commit_message, mo.hstack([push_btn, pull_btn])])
+
     return commit_message, mo, os, pull_btn, push_btn, subprocess
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
     output = ""
     work_dir = "/marimo"
