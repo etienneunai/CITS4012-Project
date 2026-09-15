@@ -25,6 +25,7 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
     gh_token = os.environ.get("GITHUB_TOKEN")
     repo_slug = "etienneunai/CITS4012-Project"
 
+
     def run_git(cmd, cwd=work_dir):
         res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         combined = (res.stdout + "\n" + res.stderr).strip()
@@ -32,6 +33,7 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
         if gh_token:
             combined = combined.replace(gh_token, "[REDACTED_TOKEN]")
         return res.returncode, combined
+
 
     if push_btn.value:
         if not gh_token:
@@ -41,9 +43,27 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
             logs = []
 
             # 1. Global configs executed from /root to bypass container permission checks
-            run_git(["git", "config", "--global", "--add", "safe.directory", work_dir], cwd="/root")
-            run_git(["git", "config", "--global", "user.name", "Etienne Vinton Horn"], cwd="/root")
-            run_git(["git", "config", "--global", "user.email", "etienneunai@gmail.com"], cwd="/root")
+            run_git(
+                ["git", "config", "--global", "--add", "safe.directory", work_dir],
+                cwd="/root",
+            )
+            run_git(
+                ["git", "config", "--global", "user.name", "Etienne Vinton Horn"],
+                cwd="/root",
+            )
+            run_git(
+                [
+                    "git",
+                    "config",
+                    "--global",
+                    "user.email",
+                    "etienneunai@gmail.com",
+                ],
+                cwd="/root",
+            )
+            run_git(
+                ["git", "config", "--global", "pull.rebase", "false"], cwd="/root"
+            )
 
             # 2. Auto-initialize repository if runtime was restarted
             if not os.path.exists(os.path.join(work_dir, ".git")):
@@ -55,7 +75,9 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
 
             # 4. Stage and commit
             run_git(["git", "add", "notebook.py"])
-            code, commit_out = run_git(["git", "commit", "-m", commit_message.value or "Update notebook"])
+            code, commit_out = run_git(
+                ["git", "commit", "-m", commit_message.value or "Update notebook"]
+            )
             if code != 0 and "nothing to commit" not in commit_out:
                 logs.append(f"Commit status:\n{commit_out}")
 
@@ -75,8 +97,30 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
             output = "Error: Repository not initialized. Click 'Commit & Push' once first."
         else:
             remote_url = f"https://oauth2:{gh_token}@github.com/{repo_slug}.git"
-            run_git(["git", "config", "--global", "--add", "safe.directory", work_dir], cwd="/root")
-            code, pull_out = run_git(["git", "pull", remote_url, "main"])
+            run_git(
+                ["git", "config", "--global", "--add", "safe.directory", work_dir],
+                cwd="/root",
+            )
+            run_git(
+                ["git", "config", "--global", "pull.rebase", "false"], cwd="/root"
+            )
+
+            # Reconcile divergent branch history with merge strategy
+            code, pull_out = run_git(
+                ["git", "pull", "--no-rebase", remote_url, "main"]
+            )
+            if "unrelated histories" in pull_out:
+                code, pull_out = run_git(
+                    [
+                        "git",
+                        "pull",
+                        "--no-rebase",
+                        "--allow-unrelated-histories",
+                        remote_url,
+                        "main",
+                    ]
+                )
+
             output = pull_out
 
     mo.md(f"```text\n{output}\n```") if output else None
