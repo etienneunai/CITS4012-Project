@@ -10,7 +10,10 @@ def _():
     import subprocess
     import marimo as mo
 
-    # Setup reminder - 
+    # Setup reminder - assign the following in your molab secrets - github token should be given content read/write access to the repo
+    #  GITHUB_TOKEN		
+    #  GIT_AUTHOR_EMAIL		
+    #  GIT_AUTHOR_NAME
 
     commit_message = mo.ui.text(value="Update notebook", label="Commit Message")
     push_btn = mo.ui.run_button(label="Commit & Push to Git")
