@@ -1,0 +1,64 @@
+name: Convert Marimo to Jupyter
+
+on:
+  push:
+    paths:
+      - 'notebook.py'
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install marimo nbformat
+
+      - name: Convert and sanitize notebook
+        run: |
+          # 1. Export standard ipynb
+          marimo export ipynb notebook.py -o notebook.ipynb
+
+          # 2. Filter out the MoLab git sync cells
+          python -c '
+          import json
+
+          with open("notebook.ipynb", "r", encoding="utf-8") as f:
+              nb = json.load(f)
+
+          # Ignore markers that only exist in your sync UI
+          filter_keywords = [
+              "Commit & Push to Git",
+              "GITHUB_TOKEN",
+              "# @exclude-export"
+          ]
+
+          nb["cells"] = [
+              cell for cell in nb.get("cells", [])
+              if not any(k in "".join(cell.get("source", [])) for k in filter_keywords)
+          ]
+
+          with open("notebook.ipynb", "w", encoding="utf-8") as f:
+              json.dump(nb, f, indent=1)
+          '
+
+      - name: Commit and push converted file
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add notebook.ipynb
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-convert notebook.py to clean notebook.ipynb [skip ci]"
+            git push
+          fi

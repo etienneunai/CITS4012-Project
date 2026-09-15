@@ -143,6 +143,7 @@ def _(mo):
     return
 
 
+<<<<<<< HEAD
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -196,5 +197,7 @@ def _():
     return
 
 
+=======
+>>>>>>> d5bbc1730229a67be94dd931198687a65b70d740
 if __name__ == "__main__":
     app.run()
