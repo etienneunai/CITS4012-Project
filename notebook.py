@@ -10,6 +10,8 @@ def _():
     import subprocess
     import marimo as mo
 
+    # Setup reminder - 
+
     commit_message = mo.ui.text(value="Update notebook", label="Commit Message")
     push_btn = mo.ui.run_button(label="Commit & Push to Git")
     pull_btn = mo.ui.run_button(label="Pull from Git")
@@ -23,6 +25,8 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
     output = ""
     work_dir = "/marimo"
     gh_token = os.environ.get("GITHUB_TOKEN")
+    gh_email = os.environ.get("GIT_AUTHOR_EMAIL")
+    gh_name = os.environ.get("GIT_AUTHOR_NAME")
     repo_slug = "etienneunai/CITS4012-Project"
 
 
@@ -48,7 +52,7 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
                 cwd="/root",
             )
             run_git(
-                ["git", "config", "--global", "user.name", "Etienne Vinton Horn"],
+                ["git", "config", "--global", "user.name", gh_name],
                 cwd="/root",
             )
             run_git(
@@ -57,7 +61,7 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
                     "config",
                     "--global",
                     "user.email",
-                    "etienneunai@gmail.com",
+                    gh_email,
                 ],
                 cwd="/root",
             )
