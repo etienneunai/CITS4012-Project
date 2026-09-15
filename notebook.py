@@ -42,8 +42,8 @@ def _(commit_message, mo, os, pull_btn, push_btn, subprocess):
 
             # 1. Global configs executed from /root to bypass container permission checks
             run_git(["git", "config", "--global", "--add", "safe.directory", work_dir], cwd="/root")
-            run_git(["git", "config", "--global", "user.name", "MoLab User"], cwd="/root")
-            run_git(["git", "config", "--global", "user.email", "molab@example.com"], cwd="/root")
+            run_git(["git", "config", "--global", "user.name", "Etienne Vinton Horn"], cwd="/root")
+            run_git(["git", "config", "--global", "user.email", "etienneunai@gmail.com"], cwd="/root")
 
             # 2. Auto-initialize repository if runtime was restarted
             if not os.path.exists(os.path.join(work_dir, ".git")):
