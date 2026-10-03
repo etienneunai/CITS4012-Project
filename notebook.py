@@ -128,11 +128,11 @@ def _(flatten_data, re, test_data, train_data):
     def encode(passage, question, answer):
         tokens = (
             [CLS_TOKEN]
-            + tokenize(passage)[:380]
+            + tokenize(passage)[:448]
             + [SEP_TOKEN]
-            + tokenize(question)[:64]
+            + tokenize(question)[:32]
             + [SEP_TOKEN]
-            + tokenize(answer)[:60]
+            + tokenize(answer)[:28]
             + [SEP_TOKEN]
         )
         ids = [vocab.get(t, 0) for t in tokens]
@@ -153,7 +153,7 @@ def _(flatten_data, re, test_data, train_data):
             target = torch.tensor(1.0 if label else 0.0, dtype=torch.float)
             return input_ids, target
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
 
     train_dataset = MultiRCDataset(flat_train)
     test_dataset = MultiRCDataset(flat_test)
@@ -431,13 +431,13 @@ def _(MultiHeadAttention, math, nn, torch):
         def __init__(
             self,
             vocab_size,
-            d_model=256,
-            num_heads=8,
-            num_layers=4,
-            d_ff=1024,
+            d_model=128,
+            num_heads=4,
+            num_layers=2,
+            d_ff=512,
             max_len=512,
             attention_cls=MultiHeadAttention,
-            dropout=0.1,
+            dropout=0.2,
             pos_encoding="sinusoidal",
             norm_cls=nn.LayerNorm,
             activation="gelu",
@@ -502,6 +502,7 @@ def _(
     flat_train,
     math,
     nn,
+    os,
     torch,
     vocab_size,
 ):
@@ -512,6 +513,11 @@ def _(
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {DEVICE}")
+
+    # If ≥99% of predictions are one class, the model has collapsed to always
+    # predicting that class.  val_acc then just mirrors the class distribution
+    # (e.g. 0.428 or 0.572 on this dataset) rather than reflecting real learning.
+    COLLAPSE_THRESHOLD = 0.99
 
 
     def evaluate(model, data_loader, criterion=None):
@@ -538,11 +544,12 @@ def _(
         avg_loss = total_loss / max(num_batches, 1)
         acc = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, zero_division=0)
-        return avg_loss, acc, f1
+        pos_pred_frac = sum(all_preds) / max(len(all_preds), 1)
+        return avg_loss, acc, f1, pos_pred_frac
 
 
-    def create_model(attention_cls=MultiHeadAttention, d_model=256, num_heads=8,
-                     num_layers=4, d_ff=1024, dropout=0.1,
+    def create_model(attention_cls=MultiHeadAttention, d_model=128, num_heads=4,
+                     num_layers=2, d_ff=512, dropout=0.2,
                      pos_encoding="sinusoidal", norm_cls=nn.LayerNorm,
                      activation="gelu", pooling="cls"):
         model = TransformerClassifier(
@@ -594,7 +601,7 @@ def _(
 
 
     def train_model(model, train_loader, val_loader, num_epochs=10, lr=3e-4,
-                    weight_decay=1e-4, patience=3, label="default",
+                    weight_decay=0.01, patience=3, label="default",
                     warmup_type="linear", optimizer_type="adamw",
                     scheduler_type="exponential", seed=42):
         torch.manual_seed(seed)
@@ -616,18 +623,25 @@ def _(
 
         pos_count = sum(1 for _, _, _, lbl in flat_train if lbl)
         neg_count = len(flat_train) - pos_count
-        pos_weight = torch.tensor(neg_count / pos_count, device=DEVICE)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
+        criterion = nn.BCEWithLogitsLoss()
 
         best_val_f1 = 0.0
         patience_counter = 0
-        history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": []}
+        history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [],
+                   "collapsed": False, "collapse_epoch": None, "collapse_type": None}
         global_step = 0
 
         for epoch in range(num_epochs):
             model.train()
             total_loss = 0.0
             num_batches = 0
+
+            # Track prediction distribution during the first epoch for early
+            # collapse detection.  Reuses the logits already computed for the
+            # training step — zero extra forward passes.
+            _epoch_pos_preds = 0
+            _epoch_total_preds = 0
 
             pbar = tqdm(train_loader, desc=f"[{label}] Epoch {epoch+1}/{num_epochs}", leave=False)
             for input_ids, targets in pbar:
@@ -647,13 +661,46 @@ def _(
                 num_batches += 1
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
+                # During-epoch collapse check (first epoch only): sample the
+                # prediction distribution every quarter-epoch.  A collapsed model
+                # will show ~100% one class at every checkpoint.
+                if epoch == 0:
+                    with torch.no_grad():
+                        _epoch_pos_preds += (torch.sigmoid(logits) > 0.5).long().sum().item()
+                        _epoch_total_preds += input_ids.size(0)
+
+                    _check_interval = max(1, len(train_loader) // 4)
+                    if num_batches % _check_interval == 0:
+                        _frac = _epoch_pos_preds / _epoch_total_preds
+                        if _frac >= COLLAPSE_THRESHOLD or _frac <= 1 - COLLAPSE_THRESHOLD:
+                            _ctype = "all-positive" if _frac >= COLLAPSE_THRESHOLD else "all-negative"
+                            print(f"\n\u26a0\ufe0f  [{label}] Collapse signal at batch "
+                                  f"{num_batches}/{len(train_loader)} (epoch 1): "
+                                  f"{_frac:.1%} {_ctype} predictions")
+
             avg_train_loss = total_loss / num_batches
-            val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion)
+            val_loss, val_acc, val_f1, val_pos_frac = evaluate(model, val_loader, criterion)
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
             history["val_f1"].append(val_f1)
+
+            # Post-epoch collapse check: if the model predicts a single class,
+            # val_acc just mirrors the class distribution — not real learning.
+            # Stop immediately rather than wasting the remaining epochs.
+            if val_pos_frac >= COLLAPSE_THRESHOLD or val_pos_frac <= 1 - COLLAPSE_THRESHOLD:
+                _ctype = "all-positive" if val_pos_frac >= COLLAPSE_THRESHOLD else "all-negative"
+                history["collapsed"] = True
+                history["collapse_epoch"] = epoch + 1
+                history["collapse_type"] = _ctype
+                print(f"\n{'='*60}")
+                print(f"\u26a0\ufe0f  [{label}] MODEL COLLAPSE \u2014 stopping after epoch {epoch+1}")
+                print(f"   Predictions: {val_pos_frac:.1%} positive \u2192 always '{_ctype}'")
+                print(f"   val_acc={val_acc:.4f} = class distribution, NOT learning")
+                print(f"   Skipping remaining {num_epochs - epoch - 1} epochs.")
+                print(f"{'='*60}")
+                return history
 
             print(f"[{label}] Epoch {epoch+1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}")
 
@@ -667,7 +714,9 @@ def _(
                     print(f"Early stopping at epoch {epoch+1}")
                     break
 
-        model.load_state_dict(torch.load(f"best_model_{label}.pt", weights_only=True))
+        _ckpt = f"best_model_{label}.pt"
+        if os.path.exists(_ckpt):
+            model.load_state_dict(torch.load(_ckpt, weights_only=True))
         return history
 
 
@@ -701,9 +750,18 @@ def _(
 
     # --- Experiment 1: Standard Multi-Head Attention ---
     print("=" * 60)
-    print("Experiment 1: Multi-Head Attention (4 layers, 8 heads)")
+    print("Experiment 1: Multi-Head Attention (2 layers, 4 heads)")
     print("=" * 60)
-    model_mha = create_model(attention_cls=MultiHeadAttention, num_layers=4, num_heads=8)
+
+    model_mha = create_model(
+        attention_cls=MultiHeadAttention,
+        num_layers=2, 
+        d_model=128,     
+        d_ff=512,          
+        dropout=0.2,       
+        num_heads=4,      
+    )
+
     history_mha = train_model(model_mha, train_loader, test_loader,
                               num_epochs=NUM_EPOCHS, lr=LR, label="mha")
     experiments["Multi-Head Attention"] = history_mha
@@ -958,15 +1016,23 @@ def _(mo):
     mo.md(r"""
     ## Changelog
 
+    ### Architecture
+    - **Miniaturized** from 4 layers / 256 d_model / 8 heads to **2 layers / 128 d_model / 4 heads** — fewer parameters to optimize on 27K examples
+    - **Pre-Layer Normalization** (Pre-LN): LayerNorm applied *before* attention and FFN sub-layers (not after residual), giving a direct gradient path and preventing early collapse
+
     ### Data processing
     - Raised `min_freq` from 2 to 3 — smaller vocab (~10K vs ~15.5K), each word gets more gradient updates per epoch
 
     ### Training pipeline
-    - Added `pos_weight` to `BCEWithLogitsLoss` — class imbalance (44% pos / 56% neg) was causing majority-class collapse
     - Added LR warmup — linear ramp over first 10% of steps, then exponential decay; prevents random embeddings from getting destabilised at start of training
-    - Increased base LR from `1e-4` to `3e-4` — from-scratch embeddings need stronger gradients
+    - **Increased weight decay from `1e-4` to `0.01`** — heavier regularization with AdamW forces generalization over memorization
+    - **Increased batch size from 32 to 64** — more stable gradient updates for Transformer training from scratch
+    - Dropout set to 0.2 throughout
     - Changed checkpointing from best `val_loss` to best `val_f1` — weighted loss is misleading for model selection
     - Replaced `ReduceLROnPlateau` with `LambdaLR` for warmup support
+
+    ### Positional encodings
+    - Sinusoidal positional encodings verified: added to token embeddings (`x = pos_encoding(token_embedding * sqrt(d_model))`) before the first attention layer
     """)
     return
 
