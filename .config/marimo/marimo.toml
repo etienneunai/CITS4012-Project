@@ -8,7 +8,7 @@ mode = "code_mode"
 
 [ai.models]
 autocomplete_model = "marimo/best-for-autocomplete"
-chat_model = "wandb/zai-org/GLM-5.2"
+chat_model = "wandb/deepseek-ai/DeepSeek-V4.1-Flash"
 custom_models = []
 displayed_models = []
 edit_model = "wandb/zai-org/GLM-5.2"
