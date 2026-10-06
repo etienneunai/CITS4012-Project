@@ -84,7 +84,6 @@ def _():
                     flattened_data.append((passage, question_text, answer_text, answer_val))
         return flattened_data
 
-
     return flatten_data, re
 
 
@@ -103,6 +102,7 @@ def _(flatten_data, re, test_data, train_data):
     PAD_TOKEN = "<pad>"
     CLS_TOKEN = "<cls>"
     SEP_TOKEN = "<sep>"
+    UNK_TOKEN = "<unk>"
 
     def build_vocab(flat_data, min_freq=2):
         counter = Counter()
@@ -110,7 +110,7 @@ def _(flatten_data, re, test_data, train_data):
             counter.update(tokenize(passage))
             counter.update(tokenize(question))
             counter.update(tokenize(answer))
-        vocab = {PAD_TOKEN: 0, CLS_TOKEN: 1, SEP_TOKEN: 2}
+        vocab = {PAD_TOKEN: 0, CLS_TOKEN: 1, SEP_TOKEN: 2, UNK_TOKEN: 3}
         for word, freq in counter.most_common():
             if freq >= min_freq:
                 vocab[word] = len(vocab)
@@ -119,6 +119,11 @@ def _(flatten_data, re, test_data, train_data):
     flat_train = flatten_data(train_data)
     flat_test = flatten_data(test_data)
     vocab = build_vocab(flat_train, min_freq=3)
+
+    # Unknown words map here, not to index 0 (which is <pad>).  Index 0 is the
+    # padding id, so routing OOV tokens to 0 makes them invisible to the embedding
+    # and the padding mask, and deletes their timesteps from the packed recurrence.
+    UNK_ID = vocab[UNK_TOKEN]
 
     vocab_size = len(vocab)
     print(f"Vocabulary size: {vocab_size}")
@@ -135,7 +140,7 @@ def _(flatten_data, re, test_data, train_data):
             + tokenize(answer)[:28]
             + [SEP_TOKEN]
         )
-        ids = [vocab.get(t, 0) for t in tokens]
+        ids = [vocab.get(t, UNK_ID) for t in tokens]
         ids = ids[:MAX_LEN]
         ids = ids + [0] * (MAX_LEN - len(ids))
         return ids
@@ -169,6 +174,7 @@ def _(flatten_data, re, test_data, train_data):
     return (
         Counter,
         MAX_LEN,
+        encode,
         flat_test,
         flat_train,
         test_loader,
@@ -194,8 +200,13 @@ def _(mo):
     [CLS] passage [SEP] question [SEP] answer [SEP]
     ```
 
-    The `[CLS]` token aggregates information for classification. Sequences are
-    padded to a maximum length of 512 tokens.
+    Pooling reads the GRU's states rather than a single slot: one position cannot
+    summarise a BiGRU, because the forward direction's state at position 0 has only
+    seen the first token. The default `cls` pooling therefore concatenates the
+    forward direction's final state (at each sequence's last real token) with the
+    backward direction's final state (at position 0, where the reverse pass ends).
+    Sequences are padded to a maximum length of 512 tokens, and padding is packed
+    out of the recurrent pass so it never influences either direction.
     """)
     return
 
@@ -312,12 +323,39 @@ def _(torch):
             context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
             return self.dropout(self.W_o(context))
 
-
     return LinearAttention, MultiHeadAttention, math, nn
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Bidirectional GRU encoder
+
+    The encoder is a stack of pre-norm residual blocks. Each block runs a
+    **bidirectional GRU** over the token embeddings, then an **attention
+    mechanism** over the GRU's contextual states, then a position-wise
+    feed-forward network:
+
+    ```
+    embeddings -> BiGRU -> attention -> feed-forward -> pool -> classifier
+    ```
+
+    The two GRU directions each take half of `d_model`, so their concatenated
+    states have the same width as the residual stream. Padding is packed out of
+    both directions, so the backward pass starts at each sequence's final real
+    token rather than at the batch's padding.
+
+    Every part around the recurrence is swappable through the registries
+    `ATTENTION_LAYERS`, `POS_ENCODINGS`, `NORM_LAYERS` and `ACTIVATIONS`, plus the
+    `pooling` argument (`cls`, `mean`, `max`). `pos_encoding="none"` is the
+    default because recurrence already encodes order; sinusoidal and rotary
+    remain available for the ablation.
+    """)
+    return
+
+
 @app.cell
-def _(MultiHeadAttention, math, nn, torch):
+def _(LinearAttention, MultiHeadAttention, math, nn, torch):
     # From the week 7 lecture
     class PositionalEncoding(nn.Module):
         def __init__(self, d_model, max_len=512):
@@ -371,6 +409,16 @@ def _(MultiHeadAttention, math, nn, torch):
             rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
             return x * rms * self.weight
 
+    class IdentityPositionalEncoding(nn.Module):
+        """No position signal: a bidirectional GRU consumes the sequence in order,
+        so order is already implicit and added positions are optional rather than
+        required."""
+
+        def __init__(self, d_model, max_len=512):
+            super().__init__()
+
+        def forward(self, x):
+            return x
 
     # --- Swappable activation functions ---
     ACTIVATIONS = {
@@ -383,20 +431,32 @@ def _(MultiHeadAttention, math, nn, torch):
     def get_activation(name):
         return ACTIVATIONS[name]()
 
+    # --- Swappable attention mechanisms ---
+    ATTENTION_LAYERS = {
+        "mha": MultiHeadAttention,
+        "linear": LinearAttention,
+        "none": None,
+    }
+
+
+    def get_attention_layer(attention_cls):
+        """Resolve an attention specifier: a class, or a name in ATTENTION_LAYERS."""
+        if isinstance(attention_cls, str):
+            return ATTENTION_LAYERS[attention_cls]
+        return attention_cls
+
 
     # --- Swappable positional encodings ---
     POS_ENCODINGS = {
+        "none": IdentityPositionalEncoding,
         "sinusoidal": PositionalEncoding,
         "rotary": RotaryPositionalEncoding,
     }
-
     # --- Swappable normalization layers ---
     NORM_LAYERS = {
         "layernorm": nn.LayerNorm,
         "rmsnorm": RMSNorm,
     }
-
-
     class FeedForward(nn.Module):
         def __init__(self, d_model, d_ff, dropout=0.1, activation="gelu"):
             super().__init__()
@@ -410,24 +470,72 @@ def _(MultiHeadAttention, math, nn, torch):
         def forward(self, x):
             return self.net(x)
 
+    def _run_bigru(gru, x, mask):
+        """Run a BiGRU over a padded batch and return per-timestep states.
 
-    class TransformerEncoderLayer(nn.Module):
+        Packing hides padded timesteps from both directions. Without it the
+        backward direction starts at the final <pad> of the batch instead of each
+        sequence's final real token, which contaminates the states of every short
+        sequence.
+        """
+        lengths = (~mask).sum(dim=1).clamp(min=1).cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths, batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = gru(packed)
+        gru_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True, total_length=x.size(1)
+        )
+        return gru_out
+
+
+    class BiGRUEncoderLayer(nn.Module):
+        """Pre-norm residual block: a BiGRU sub-layer, an optional attention
+        sub-layer over the GRU's contextual states, and a feed-forward sub-layer.
+
+        Attention stays pluggable: any `AttentionMechanism` sharing the
+        `forward(x, mask)` contract can be dropped in.
+        """
+
         def __init__(self, d_model, num_heads, d_ff, attention_cls, dropout=0.1,
                      norm_cls=nn.LayerNorm, activation="gelu"):
             super().__init__()
-            self.attention = attention_cls(d_model, num_heads, dropout)
-            self.norm1 = norm_cls(d_model)
-            self.norm2 = norm_cls(d_model)
+            assert d_model % 2 == 0, "d_model must be even to split across GRU directions"
+
+            # Half the width per direction, so concatenating the two directions
+            # restores d_model and the residual stream keeps a constant size.
+            self.hidden_size = d_model // 2
+            self.gru = nn.GRU(d_model, self.hidden_size, batch_first=True, bidirectional=True)
+            self.norm_gru = norm_cls(d_model)
+
+            attention_layer = get_attention_layer(attention_cls)
+            if attention_layer is None:
+                self.attention = None
+                self.norm_attention = None
+            else:
+                self.attention = attention_layer(d_model, num_heads, dropout)
+                self.norm_attention = norm_cls(d_model)
+
             self.ffn = FeedForward(d_model, d_ff, dropout, activation)
+            self.norm_ffn = norm_cls(d_model)
+
             self.dropout = nn.Dropout(dropout)
 
         def forward(self, x, mask=None):
-            x = x + self.dropout(self.attention(self.norm1(x), mask))
-            x = x + self.dropout(self.ffn(self.norm2(x)))
+            gru_out = _run_bigru(self.gru, self.norm_gru(x), mask)
+            x = x + self.dropout(gru_out)
+
+            if self.attention is not None:
+                x = x + self.dropout(self.attention(self.norm_attention(x), mask))
+
+            x = x + self.dropout(self.ffn(self.norm_ffn(x)))
             return x
 
 
-    class TransformerClassifier(nn.Module):
+    class BiGRUClassifier(nn.Module):
+        """Bidirectional GRU encoder over token embeddings, with an attention
+        mechanism refining its states before pooling and classification."""
+
         def __init__(
             self,
             vocab_size,
@@ -438,7 +546,7 @@ def _(MultiHeadAttention, math, nn, torch):
             max_len=512,
             attention_cls=MultiHeadAttention,
             dropout=0.2,
-            pos_encoding="sinusoidal",
+            pos_encoding="none",
             norm_cls=nn.LayerNorm,
             activation="gelu",
             pooling="cls",
@@ -451,7 +559,7 @@ def _(MultiHeadAttention, math, nn, torch):
             self.pos_encoding = POS_ENCODINGS[pos_encoding](d_model, max_len)
 
             self.layers = nn.ModuleList([
-                TransformerEncoderLayer(
+                BiGRUEncoderLayer(
                     d_model, num_heads, d_ff, attention_cls, dropout,
                     norm_cls=norm_cls, activation=activation,
                 )
@@ -466,39 +574,54 @@ def _(MultiHeadAttention, math, nn, torch):
                 nn.Linear(d_model, 1),
             )
 
+        def _pool(self, x, mask):
+            if self.pooling == "cls":
+                # Pool each direction at its *final* state.  For a BiGRU the
+                # forward direction's full-sequence summary sits at each sequence's
+                # last real token, and the backward direction's sits at position 0
+                # (it read the sequence in reverse).  Position 0 on its own is not a
+                # summary: the forward state there has seen only the first token, so
+                # half the pooled vector would be a constant independent of input.
+                batch = torch.arange(x.size(0), device=x.device)
+                lengths = (~mask).sum(dim=1).clamp(min=1)
+                last = (lengths - 1).clamp(min=0)
+                half = self.d_model // 2
+                forward_final = x[batch, last, :half]
+                backward_final = x[:, 0, half:]
+                return torch.cat([forward_final, backward_final], dim=-1)
+
+            if self.pooling == "mean":
+                keep = (~mask).unsqueeze(-1).float()
+                return (x * keep).sum(1) / keep.sum(1).clamp(min=1)
+
+            if self.pooling == "max":
+                return x.masked_fill(mask.unsqueeze(-1), -1e9).max(1).values
+
+            raise ValueError(f"Unknown pooling: {self.pooling}")
+
         def forward(self, input_ids):
             mask = (input_ids == 0)
 
-            x = self.token_embedding(input_ids) * math.sqrt(self.d_model)
+            x = self.token_embedding(input_ids)
             x = self.pos_encoding(x)
 
             for layer in self.layers:
                 x = layer(x, mask)
 
             x = self.norm(x)
-
-            if self.pooling == "cls":
-                pooled = x[:, 0, :]
-            elif self.pooling == "mean":
-                _mask_exp = (~mask).unsqueeze(-1).float()
-                pooled = (x * _mask_exp).sum(1) / _mask_exp.sum(1).clamp(min=1)
-            elif self.pooling == "max":
-                _mask_exp = mask.unsqueeze(-1)
-                pooled = x.masked_fill(_mask_exp, -1e9).max(1).values
-            else:
-                pooled = x[:, 0, :]
+            pooled = self._pool(x, mask)
 
             return self.classifier(pooled).squeeze(-1)
 
 
-    return RMSNorm, TransformerClassifier
+    return BiGRUClassifier, RMSNorm
 
 
 @app.cell
 def _(
+    BiGRUClassifier,
     MAX_LEN,
     MultiHeadAttention,
-    TransformerClassifier,
     flat_train,
     math,
     nn,
@@ -509,21 +632,31 @@ def _(
     # train the mfs
     import torch.optim as optim
     from tqdm import tqdm
-    from sklearn.metrics import f1_score, accuracy_score
+    from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {DEVICE}")
 
-    # If ≥99% of predictions are one class, the model has collapsed to always
-    # predicting that class.  val_acc then just mirrors the class distribution
-    # (e.g. 0.428 or 0.572 on this dataset) rather than reflecting real learning.
+    # "Collapse" means the model emits essentially the same score for every input.
+    # Testing the predicted-class fraction alone is not enough: on this 57/43 split
+    # a run that is still learning can sit on one side of the 0.5 decision boundary
+    # for a whole epoch, and killing it there throws away a recoverable run.  A
+    # collapse therefore requires all of:
+    #   * a single predicted class (>= 99% or <= 1%),
+    #   * chance-level ranking ability (ROC-AUC ~ 0.5), and
+    #   * at least COLLAPSE_MIN_EPOCH epochs of training,
+    # held for COLLAPSE_PATIENCE consecutive epochs.
     COLLAPSE_THRESHOLD = 0.99
+    COLLAPSE_AUC_TOL = 0.02
+    COLLAPSE_PATIENCE = 2
+    COLLAPSE_MIN_EPOCH = 3
 
 
     def evaluate(model, data_loader, criterion=None):
         model.eval()
         all_preds = []
         all_labels = []
+        all_scores = []
         total_loss = 0.0
         num_batches = 0
 
@@ -537,22 +670,25 @@ def _(
                     total_loss += criterion(logits, targets).item()
                     num_batches += 1
 
-                preds = (torch.sigmoid(logits) > 0.5).long().cpu().numpy()
-                all_preds.extend(preds)
+                scores = torch.sigmoid(logits)
+                all_preds.extend((scores > 0.5).long().cpu().numpy())
                 all_labels.extend(targets.long().cpu().numpy())
+                all_scores.extend(scores.cpu().numpy())
 
         avg_loss = total_loss / max(num_batches, 1)
         acc = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, zero_division=0)
         pos_pred_frac = sum(all_preds) / max(len(all_preds), 1)
-        return avg_loss, acc, f1, pos_pred_frac
+        # Ranking ability is threshold-free; a collapsed model sits at AUC 0.5.
+        auc = roc_auc_score(all_labels, all_scores) if len(set(all_labels)) > 1 else 0.5
+        return avg_loss, acc, f1, pos_pred_frac, auc
 
 
     def create_model(attention_cls=MultiHeadAttention, d_model=128, num_heads=4,
                      num_layers=2, d_ff=512, dropout=0.2,
-                     pos_encoding="sinusoidal", norm_cls=nn.LayerNorm,
+                     pos_encoding="none", norm_cls=nn.LayerNorm,
                      activation="gelu", pooling="cls"):
-        model = TransformerClassifier(
+        model = BiGRUClassifier(
             vocab_size=vocab_size,
             d_model=d_model,
             num_heads=num_heads,
@@ -623,12 +759,13 @@ def _(
 
         pos_count = sum(1 for _, _, _, lbl in flat_train if lbl)
         neg_count = len(flat_train) - pos_count
-    
+
         criterion = nn.BCEWithLogitsLoss()
 
         best_val_f1 = 0.0
         patience_counter = 0
-        history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [],
+        collapse_streak = 0
+        history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [], "val_auc": [],
                    "collapsed": False, "collapse_epoch": None, "collapse_type": None}
         global_step = 0
 
@@ -674,35 +811,48 @@ def _(
                         _frac = _epoch_pos_preds / _epoch_total_preds
                         if _frac >= COLLAPSE_THRESHOLD or _frac <= 1 - COLLAPSE_THRESHOLD:
                             _ctype = "all-positive" if _frac >= COLLAPSE_THRESHOLD else "all-negative"
-                            print(f"\n\u26a0\ufe0f  [{label}] Collapse signal at batch "
+                            print(f"\n\u26a0\ufe0f  [{label}] single-class signal at batch "
                                   f"{num_batches}/{len(train_loader)} (epoch 1): "
                                   f"{_frac:.1%} {_ctype} predictions")
 
             avg_train_loss = total_loss / num_batches
-            val_loss, val_acc, val_f1, val_pos_frac = evaluate(model, val_loader, criterion)
+            val_loss, val_acc, val_f1, val_pos_frac, val_auc = evaluate(model, val_loader, criterion)
 
             history["train_loss"].append(avg_train_loss)
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
             history["val_f1"].append(val_f1)
+            history["val_auc"].append(val_auc)
 
-            # Post-epoch collapse check: if the model predicts a single class,
-            # val_acc just mirrors the class distribution — not real learning.
-            # Stop immediately rather than wasting the remaining epochs.
-            if val_pos_frac >= COLLAPSE_THRESHOLD or val_pos_frac <= 1 - COLLAPSE_THRESHOLD:
-                _ctype = "all-positive" if val_pos_frac >= COLLAPSE_THRESHOLD else "all-negative"
+            # Post-epoch collapse check.  A collapsed model ranks no better than
+            # chance, so require chance-level AUC *as well as* a single predicted
+            # class, and let the signal persist across epochs before stopping.
+            single_class = val_pos_frac >= COLLAPSE_THRESHOLD or val_pos_frac <= 1 - COLLAPSE_THRESHOLD
+            no_ranking = val_auc <= 0.5 + COLLAPSE_AUC_TOL
+
+            if single_class:
+                _ctype = "all-positive" if val_pos_frac > 0.5 else "all-negative"
+                print(f"   [{label}] single-class predictions: {val_pos_frac:.1%} positive "
+                      f"(val_auc={val_auc:.4f}, val_f1={val_f1:.4f})")
+
+            if single_class and no_ranking and (epoch + 1) >= COLLAPSE_MIN_EPOCH:
+                collapse_streak += 1
+            else:
+                collapse_streak = 0
+
+            if collapse_streak >= COLLAPSE_PATIENCE:
                 history["collapsed"] = True
                 history["collapse_epoch"] = epoch + 1
                 history["collapse_type"] = _ctype
                 print(f"\n{'='*60}")
                 print(f"\u26a0\ufe0f  [{label}] MODEL COLLAPSE \u2014 stopping after epoch {epoch+1}")
                 print(f"   Predictions: {val_pos_frac:.1%} positive \u2192 always '{_ctype}'")
-                print(f"   val_acc={val_acc:.4f} = class distribution, NOT learning")
+                print(f"   val_auc={val_auc:.4f} \u2248 chance, val_f1={val_f1:.4f} \u2192 no ranking ability")
                 print(f"   Skipping remaining {num_epochs - epoch - 1} epochs.")
                 print(f"{'='*60}")
                 return history
 
-            print(f"[{label}] Epoch {epoch+1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f}")
+            print(f"[{label}] Epoch {epoch+1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} val_f1={val_f1:.4f} val_auc={val_auc:.4f}")
 
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
@@ -719,8 +869,7 @@ def _(
             model.load_state_dict(torch.load(_ckpt, weights_only=True))
         return history
 
-
-    return create_model, train_model
+    return DEVICE, create_model, train_model
 
 
 @app.cell(hide_code=True)
@@ -733,6 +882,14 @@ def _(mo):
 
 
 @app.cell
+def _():
+    import matplotlib.pyplot as plt
+
+
+    return (plt,)
+
+
+@app.cell
 def _(
     MultiHeadAttention,
     create_model,
@@ -741,10 +898,10 @@ def _(
     train_model,
 ):
     # Test the default configuration
-    import matplotlib.pyplot as plt
-
     NUM_EPOCHS = 10
-    LR = 1e-4
+    # 1e-4 keeps the model near the base rate for several epochs; the library
+    # default for training from scratch is 3e-4.
+    LR = 3e-4
 
     experiments = {}
 
@@ -767,7 +924,81 @@ def _(
     experiments["Multi-Head Attention"] = history_mha
 
     print("\nAll experiments complete.")
-    return experiments, plt
+    return experiments, model_mha
+
+
+@app.cell
+def _(DEVICE, encode, flat_test, model_mha, torch):
+    # Test the trained default-configuration model (model_mha) on sample answers.
+    #
+    # The classifier scores each (passage, question, answer) triple independently,
+    # so we sample a few test questions and score *every* candidate answer for them,
+    # then compare the model's predicted labels against the gold labels.
+    import random
+
+    N_SAMPLE_QUESTIONS = 5
+    SAMPLE_SEED = 42
+
+    # Regroup the flat test tuples into (passage, question) -> [candidate answers].
+    _grouped_questions = {}
+    for _passage, _question, _answer, _label in flat_test:
+        _grouped_questions.setdefault((_passage, _question), []).append((_answer, bool(_label)))
+
+    _sample_keys = random.Random(SAMPLE_SEED).sample(
+        list(_grouped_questions), min(N_SAMPLE_QUESTIONS, len(_grouped_questions))
+    )
+
+    # Score every candidate answer for each sampled question in a single batch.
+    model_mha.eval()
+    sample_results = []
+    with torch.no_grad():
+        for _passage, _question in _sample_keys:
+            _answers = _grouped_questions[(_passage, _question)]
+            _input_ids = torch.tensor(
+                [encode(_passage, _question, _answer) for _answer, _ in _answers],
+                dtype=torch.long,
+            ).to(DEVICE)
+            _scores = torch.sigmoid(model_mha(_input_ids)).cpu().tolist()
+            sample_results.append({
+                "passage": _passage,
+                "question": _question,
+                "answers": [
+                    {
+                        "answer": _answer,
+                        "score": _score,
+                        "predicted": _score > 0.5,
+                        "gold": _gold,
+                        "correct": (_score > 0.5) == _gold,
+                    }
+                    for (_answer, _gold), _score in zip(_answers, _scores)
+                ],
+            })
+
+    # --- Report ---
+    _scored = _correct = 0
+    print("=" * 72)
+    print(f"Sample answers -- model_mha (default configuration), seed={SAMPLE_SEED}")
+    print("=" * 72)
+    for _result in sample_results:
+        _passage = _result["passage"]
+        _snippet = _passage[:150] + ("..." if len(_passage) > 150 else "")
+        print(f"\nQ: {_result['question']}")
+        print(f"   Passage: {_snippet}")
+        for _row in _result["answers"]:
+            _scored += 1
+            _correct += _row["correct"]
+            _answer = _row["answer"]
+            if len(_answer) > 52:
+                _answer = _answer[:49] + "..."
+            _pred = "yes" if _row["predicted"] else "no "
+            _gold = "yes" if _row["gold"] else "no "
+            _mark = "ok" if _row["correct"] else "--"
+            print(f"   {_row['score']:>7.3f}   pred={_pred}   gold={_gold}   {_mark}   {_answer}")
+    print("\n" + "=" * 72)
+    print(f"Sample accuracy: {_correct}/{_scored} = {_correct / max(_scored, 1):.1%}")
+    print("=" * 72)
+
+    return
 
 
 @app.cell
@@ -1017,22 +1248,31 @@ def _(mo):
     ## Changelog
 
     ### Architecture
-    - **Miniaturized** from 4 layers / 256 d_model / 8 heads to **2 layers / 128 d_model / 4 heads** — fewer parameters to optimize on 27K examples
-    - **Pre-Layer Normalization** (Pre-LN): LayerNorm applied *before* attention and FFN sub-layers (not after residual), giving a direct gradient path and preventing early collapse
+    - **Encoder swapped from a Transformer to a stack of bidirectional GRU blocks.** Attention is kept, but it now attends over the GRU's contextual states instead of over the raw token embeddings.
+    - Each block is pre-norm residual: `BiGRU -> attention -> feed-forward`, so the attention mechanism stays swappable (`MultiHeadAttention`, `LinearAttention`, or `None` for a pure BiGRU baseline).
+    - Each GRU direction uses `d_model // 2` hidden units, so the concatenated directions restore `d_model` and the residual stream keeps a constant width.
+    - Padded timesteps are **packed** (`pack_padded_sequence`) for both directions. Without packing the backward pass starts at the final `<pad>` of the batch instead of each sequence's final real token, contaminating the states of every short sequence.
+    - **Fixed `cls` pooling.** It used to pool at position 0, on the false premise that a bidirectional GRU's state there has read the whole sequence. Only the reverse direction has; the forward state at position 0 has seen just the first token, so half the pooled vector was a constant and the model collapsed to the majority class within one epoch. `cls` now concatenates the forward direction's final state (last real token) with the backward direction's final state (position 0).
+    - **Pre-Layer Normalization** (Pre-LN): norms applied *before* the GRU, attention and FFN sub-layers, giving a direct gradient path and preventing early collapse.
+    - **Sized at 2 layers / 128 d_model / 4 heads** — a GRU over 512-token sequences is already the model's cost centre.
+    - Token embeddings are no longer scaled by `sqrt(d_model)`: that scaling compensated for additive positional encodings, which a recurrent encoder does not need.
 
     ### Data processing
     - Raised `min_freq` from 2 to 3 — smaller vocab (~10K vs ~15.5K), each word gets more gradient updates per epoch
+    - Unknown tokens now map to a dedicated `<unk>` id instead of `<pad>` (id 0). Routing OOV to 0 previously made them invisible to the embedding and the padding mask, and dropped their timesteps from the packed recurrence.
 
     ### Training pipeline
     - Added LR warmup — linear ramp over first 10% of steps, then exponential decay; prevents random embeddings from getting destabilised at start of training
     - **Increased weight decay from `1e-4` to `0.01`** — heavier regularization with AdamW forces generalization over memorization
-    - **Increased batch size from 32 to 64** — more stable gradient updates for Transformer training from scratch
+    - **Increased batch size from 32 to 64** — more stable gradient updates for training from scratch
     - Dropout set to 0.2 throughout
     - Changed checkpointing from best `val_loss` to best `val_f1` — weighted loss is misleading for model selection
     - Replaced `ReduceLROnPlateau` with `LambdaLR` for warmup support
+    - **Collapse detection now needs more than one-class predictions.** It also requires chance-level ROC-AUC and that the signal persist for several epochs, so a run merely sitting on one side of the 0.5 boundary on a 57/43 split is no longer stopped after epoch 1. Validation AUC is recorded in each history.
 
     ### Positional encodings
-    - Sinusoidal positional encodings verified: added to token embeddings (`x = pos_encoding(token_embedding * sqrt(d_model))`) before the first attention layer
+    - Default is now `none`: recurrence encodes order implicitly, so added positions are optional
+    - Sinusoidal and rotary (RoPE) encodings stay in `POS_ENCODINGS`, so the ablation can measure whether they still help a BiGRU
     """)
     return
 
@@ -1047,21 +1287,24 @@ def _(mo):
 
     | Component | Options |
     |-----------|---------|
-    | **Attention** | Multi-Head Attention, Linear Attention |
+    | **Attention** | Multi-Head, Linear, None (GRU only) |
     | **Activation** | GELU, ReLU, SiLU |
-    | **Positional Encoding** | Sinusoidal, Rotary (RoPE) |
+    | **Positional Encoding** | None, Sinusoidal, Rotary (RoPE) |
     | **Normalisation** | LayerNorm, RMSNorm |
     | **Pooling** | CLS-token, Mean |
     | **LR Warmup** | Linear, None |
     | **Optimizer** | AdamW, Adam |
     | **LR Scheduler** | Exponential decay, Cosine decay |
 
-    Each combination is trained for the same number of epochs with an identical
-    seed (`42`) to ensure fair comparison. Results are saved to `ablation_results/`
+    The `none` attention option isolates the bidirectional GRU backbone, so the
+    table shows what the attention sub-layer contributes on top of it. Each
+    combination is trained for the same number of epochs with an identical seed
+    (`42`) to ensure fair comparison. Results are saved to `ablation_results/`
     including a CSV table, training histories, and visualisation plots.
 
-    > Warning: This cell runs 384 experiments and will take a very long time.
-    > Do NOT run it casually.
+    > Warning: This cell runs 864 experiments and will take a very long time.
+    > Set `RUN_ABLATION = True` in the cell below to launch it, and trim the
+    > option lists first if you only need a subset.
     """)
     return
 
@@ -1083,276 +1326,279 @@ def _(
     train_model,
 ):
     # === Comprehensive Ablation Study ===
-    # WARNING: 384 combinations x 10 epochs -- this will take a VERY long time.
+    # WARNING: 864 combinations x 10 epochs -- this will take a VERY long time.
     # Results are saved to ablation_results/.
-    # DO NOT run this cell casually.
+    # Set RUN_ABLATION to True to launch the sweep.
 
-    import itertools
-    import pandas as pd
+    RUN_ABLATION = False
 
-    SEED = 42
-    ABLATION_EPOCHS = 10
-    ABLATION_LR = 1e-4
-    ABLATION_DIR = "ablation_results"
-    os.makedirs(ABLATION_DIR, exist_ok=True)
+    if RUN_ABLATION:
 
-    # Global seed for reproducibility
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
+        import itertools
+        import pandas as pd
 
-    # --- Swappable component options ---
-    attention_opts = {"mha": MultiHeadAttention, "linear": LinearAttention}
-    activation_opts = ["gelu", "relu", "silu"]
-    pos_enc_opts = ["sinusoidal", "rotary"]
-    norm_opts = {"layernorm": nn.LayerNorm, "rmsnorm": RMSNorm}
-    pooling_opts = ["cls", "mean"]
-    warmup_opts = ["linear", "none"]
-    optimizer_opts = ["adamw", "adam"]
-    scheduler_opts = ["exponential", "cosine"]
+        SEED = 42
+        ABLATION_EPOCHS = 10
+        ABLATION_LR = 1e-4
+        ABLATION_DIR = "ablation_results"
+        os.makedirs(ABLATION_DIR, exist_ok=True)
 
-    # Column names for results table (matches keys in result dicts)
-    _ablation_cols = ["attention", "activation", "pos_encoding", "norm",
-                       "pooling", "warmup", "optimizer", "scheduler"]
-
-    # --- Build all combinations ---
-    _ablation_combos = list(itertools.product(
-        attention_opts.items(),
-        activation_opts,
-        pos_enc_opts,
-        norm_opts.items(),
-        pooling_opts,
-        warmup_opts,
-        optimizer_opts,
-        scheduler_opts,
-    ))
-    _ablation_total = len(_ablation_combos)
-    print(f"Total ablation combinations: {_ablation_total}")
-    print(f"Estimated: {_ablation_total} models x {ABLATION_EPOCHS} epochs each")
-    print("=" * 70)
-
-    ablation_results = []
-    ablation_histories = {}
-
-    for _i, (_attn, _act, _pos, _norm, _pool, _warm, _opt, _sched) in enumerate(_ablation_combos):
-        _attn_name, _attn_cls = _attn
-        _norm_name, _norm_cls = _norm
-        _combo = f"{_attn_name}|{_act}|{_pos}|{_norm_name}|{_pool}|{_warm}|{_opt}|{_sched}"
-        _label = f"abl_{_i:03d}"
-
-        print(f"\n[{_i+1}/{_ablation_total}] {_combo}")
-        print("-" * 60)
-
-        # Reset seed before each run for fair comparison
+        # Global seed for reproducibility
         torch.manual_seed(SEED)
+        np.random.seed(SEED)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
 
-        _model = create_model(
-            attention_cls=_attn_cls,
-            pos_encoding=_pos,
-            norm_cls=_norm_cls,
-            activation=_act,
-            pooling=_pool,
-        )
+        # --- Swappable component options ---
+        attention_opts = {"mha": MultiHeadAttention, "linear": LinearAttention, "none": None}
+        activation_opts = ["gelu", "relu", "silu"]
+        pos_enc_opts = ["none", "sinusoidal", "rotary"]
+        norm_opts = {"layernorm": nn.LayerNorm, "rmsnorm": RMSNorm}
+        pooling_opts = ["cls", "mean"]
+        warmup_opts = ["linear", "none"]
+        optimizer_opts = ["adamw", "adam"]
+        scheduler_opts = ["exponential", "cosine"]
 
-        _hist = train_model(
-            _model, train_loader, test_loader,
-            num_epochs=ABLATION_EPOCHS, lr=ABLATION_LR,
-            label=_label,
-            warmup_type=_warm,
-            optimizer_type=_opt,
-            scheduler_type=_sched,
-            seed=SEED,
-        )
+        # Column names for results table (matches keys in result dicts)
+        _ablation_cols = ["attention", "activation", "pos_encoding", "norm",
+                           "pooling", "warmup", "optimizer", "scheduler"]
 
-        ablation_histories[_combo] = _hist
-        _best_idx = max(range(len(_hist["val_f1"])), key=lambda j: _hist["val_f1"][j])
-        ablation_results.append({
-            "attention": _attn_name,
-            "activation": _act,
-            "pos_encoding": _pos,
-            "norm": _norm_name,
-            "pooling": _pool,
-            "warmup": _warm,
-            "optimizer": _opt,
-            "scheduler": _sched,
-            "best_val_f1": _hist["val_f1"][_best_idx],
-            "best_val_acc": _hist["val_acc"][_best_idx],
-            "final_val_f1": _hist["val_f1"][-1],
-            "final_val_acc": _hist["val_acc"][-1],
-            "best_epoch": _best_idx + 1,
-            "final_train_loss": _hist["train_loss"][-1],
-        })
+        # --- Build all combinations ---
+        _ablation_combos = list(itertools.product(
+            attention_opts.items(),
+            activation_opts,
+            pos_enc_opts,
+            norm_opts.items(),
+            pooling_opts,
+            warmup_opts,
+            optimizer_opts,
+            scheduler_opts,
+        ))
+        _ablation_total = len(_ablation_combos)
+        print(f"Total ablation combinations: {_ablation_total}")
+        print(f"Estimated: {_ablation_total} models x {ABLATION_EPOCHS} epochs each")
+        print("=" * 70)
 
-        # Clean up checkpoint and free memory
-        _ckpt = f"best_model_{_label}.pt"
-        if os.path.exists(_ckpt):
-            os.remove(_ckpt)
-        del _model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        ablation_results = []
+        ablation_histories = {}
 
-    # --- Save results to CSV ---
-    results_df = pd.DataFrame(ablation_results)
-    results_df.to_csv(os.path.join(ABLATION_DIR, "ablation_results.csv"), index=False)
-    print(f"\nResults saved to {ABLATION_DIR}/ablation_results.csv")
+        for _i, (_attn, _act, _pos, _norm, _pool, _warm, _opt, _sched) in enumerate(_ablation_combos):
+            _attn_name, _attn_cls = _attn
+            _norm_name, _norm_cls = _norm
+            _combo = f"{_attn_name}|{_act}|{_pos}|{_norm_name}|{_pool}|{_warm}|{_opt}|{_sched}"
+            _label = f"abl_{_i:03d}"
 
-    # --- Save histories to JSON ---
-    with open(os.path.join(ABLATION_DIR, "ablation_histories.json"), "w") as _f:
-        json.dump(ablation_histories, _f)
-    print(f"Histories saved to {ABLATION_DIR}/ablation_histories.json")
+            print(f"\n[{_i+1}/{_ablation_total}] {_combo}")
+            print("-" * 60)
 
-    # --- Results table ---
-    results_sorted = results_df.sort_values("best_val_f1", ascending=False).reset_index(drop=True)
-    print("\n" + "=" * 130)
-    print("ABLATION STUDY RESULTS -- sorted by best Val F1 (top 30 shown)")
-    print("=" * 130)
-    print(results_sorted.head(30).to_string(index=False))
-    print("=" * 130)
+            # Reset seed before each run for fair comparison
+            torch.manual_seed(SEED)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(SEED)
 
-    # --- Visualisation 1: Component importance bar charts ---
-    _fig1, _axes1 = plt.subplots(2, 4, figsize=(24, 10))
-    _fig1.suptitle("Ablation -- Mean Best Val F1 by Component Option", fontsize=14, fontweight="bold")
-    for _ax, _col in zip(_axes1.flat, _ablation_cols):
-        _means = results_df.groupby(_col)["best_val_f1"].mean().sort_values(ascending=False)
-        _bars = _ax.bar(range(len(_means)), _means.values, color="steelblue", edgecolor="black")
-        _ax.set_xticks(range(len(_means)))
-        _ax.set_xticklabels(_means.index, rotation=30, ha="right")
-        _ax.set_ylabel("Mean Best Val F1")
-        _ax.set_title(_col)
-        for _bar, _val in zip(_bars, _means.values):
-            _ax.text(_bar.get_x() + _bar.get_width() / 2, _bar.get_height() + 0.001,
-                     f"{_val:.4f}", ha="center", va="bottom", fontsize=9)
-        _ax.set_ylim(_means.min() - 0.02, _means.max() + 0.02)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(os.path.join(ABLATION_DIR, "component_importance.png"), dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: component_importance.png")
+            _model = create_model(
+                attention_cls=_attn_cls,
+                pos_encoding=_pos,
+                norm_cls=_norm_cls,
+                activation=_act,
+                pooling=_pool,
+            )
 
-    # --- Visualisation 2: Box plots of F1 distribution by component ---
-    _fig2, _axes2 = plt.subplots(2, 4, figsize=(24, 10))
-    _fig2.suptitle("Ablation -- Best Val F1 Distribution by Component", fontsize=14, fontweight="bold")
-    for _ax, _col in zip(_axes2.flat, _ablation_cols):
-        _groups = [results_df[results_df[_col] == v]["best_val_f1"].values
-                   for v in results_df[_col].unique()]
-        _labels = list(results_df[_col].unique())
-        _bp = _ax.boxplot(_groups, tick_labels=_labels, patch_artist=True)
-        for _patch in _bp["boxes"]:
-            _patch.set_facecolor("lightblue")
-            _patch.set_alpha(0.7)
-        _ax.set_ylabel("Best Val F1")
-        _ax.set_title(_col)
-        _ax.tick_params(axis="x", rotation=30)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(os.path.join(ABLATION_DIR, "f1_boxplots.png"), dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: f1_boxplots.png")
+            _hist = train_model(
+                _model, train_loader, test_loader,
+                num_epochs=ABLATION_EPOCHS, lr=ABLATION_LR,
+                label=_label,
+                warmup_type=_warm,
+                optimizer_type=_opt,
+                scheduler_type=_sched,
+                seed=SEED,
+            )
 
-    # --- Visualisation 3: Pairwise heatmaps ---
-    _fig3, _axes3 = plt.subplots(1, 3, figsize=(21, 6))
-    _fig3.suptitle("Ablation -- Pairwise Component Interactions (Mean Best Val F1)",
-                   fontsize=14, fontweight="bold")
-    _pairs = [("attention", "activation"), ("norm", "pooling"), ("warmup", "optimizer")]
-    for _ax, (_c1, _c2) in zip(_axes3, _pairs):
-        _pivot = results_df.pivot_table(values="best_val_f1", index=_c1, columns=_c2, aggfunc="mean")
-        _im = _ax.imshow(_pivot.values, cmap="YlOrRd", aspect="auto")
-        _ax.set_xticks(range(len(_pivot.columns)))
-        _ax.set_xticklabels(_pivot.columns, rotation=30, ha="right")
-        _ax.set_yticks(range(len(_pivot.index)))
-        _ax.set_yticklabels(_pivot.index)
-        _ax.set_xlabel(_c2)
-        _ax.set_ylabel(_c1)
-        _ax.set_title(f"{_c1} x {_c2}")
-        for _r in range(len(_pivot.index)):
-            for _c in range(len(_pivot.columns)):
-                _ax.text(_c, _r, f"{_pivot.values[_r, _c]:.4f}",
-                         ha="center", va="center", fontsize=11, fontweight="bold")
-        _fig3.colorbar(_im, ax=_ax, shrink=0.8)
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    plt.savefig(os.path.join(ABLATION_DIR, "pairwise_heatmaps.png"), dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: pairwise_heatmaps.png")
+            ablation_histories[_combo] = _hist
+            _best_idx = max(range(len(_hist["val_f1"])), key=lambda j: _hist["val_f1"][j])
+            ablation_results.append({
+                "attention": _attn_name,
+                "activation": _act,
+                "pos_encoding": _pos,
+                "norm": _norm_name,
+                "pooling": _pool,
+                "warmup": _warm,
+                "optimizer": _opt,
+                "scheduler": _sched,
+                "best_val_f1": _hist["val_f1"][_best_idx],
+                "best_val_acc": _hist["val_acc"][_best_idx],
+                "final_val_f1": _hist["val_f1"][-1],
+                "final_val_acc": _hist["val_acc"][-1],
+                "best_epoch": _best_idx + 1,
+                "final_train_loss": _hist["train_loss"][-1],
+            })
 
-    # --- Visualisation 4: Top-10 training curves ---
-    _top10 = results_sorted.head(10)
-    _fig4, _axes4 = plt.subplots(1, 2, figsize=(16, 6))
-    _fig4.suptitle("Top-10 Configurations -- Training Curves", fontsize=14, fontweight="bold")
-    for _, _row in _top10.iterrows():
-        _name = "|".join(str(_row[c]) for c in _ablation_cols)
-        _h = ablation_histories[_name]
-        _axes4[0].plot(_h["train_loss"], label=_name, alpha=0.8)
-        _axes4[1].plot(_h["val_f1"], label=_name, alpha=0.8, marker="o")
-    _axes4[0].set_title("Training Loss")
-    _axes4[0].set_xlabel("Epoch")
-    _axes4[0].set_ylabel("Loss")
-    _axes4[0].legend(fontsize=6, loc="upper right")
-    _axes4[1].set_title("Validation F1")
-    _axes4[1].set_xlabel("Epoch")
-    _axes4[1].set_ylabel("F1")
-    _axes4[1].legend(fontsize=6, loc="lower right")
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    plt.savefig(os.path.join(ABLATION_DIR, "top10_curves.png"), dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: top10_curves.png")
+            # Clean up checkpoint and free memory
+            _ckpt = f"best_model_{_label}.pt"
+            if os.path.exists(_ckpt):
+                os.remove(_ckpt)
+            del _model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    # --- Visualisation 5: Parallel coordinates ---
-    _fig5, _ax5 = plt.subplots(figsize=(18, 8))
-    _fig5.suptitle("Ablation -- Parallel Coordinates (coloured by Best Val F1)",
-                   fontsize=14, fontweight="bold")
-    _pc_data = results_df[_ablation_cols + ["best_val_f1"]].copy()
-    _pc_enc = {}
-    for _col in _ablation_cols:
-        _vals = sorted(_pc_data[_col].unique())
-        _pc_enc[_col] = {v: i for i, v in enumerate(_vals)}
-        _pc_data[_col] = _pc_data[_col].map(_pc_enc[_col])
+        # --- Save results to CSV ---
+        results_df = pd.DataFrame(ablation_results)
+        results_df.to_csv(os.path.join(ABLATION_DIR, "ablation_results.csv"), index=False)
+        print(f"\nResults saved to {ABLATION_DIR}/ablation_results.csv")
 
-    _f1_min = results_df["best_val_f1"].min()
-    _f1_max = results_df["best_val_f1"].max()
-    _f1_range = _f1_max - _f1_min + 1e-8
-    for _, _row in _pc_data.iterrows():
-        _vals = [_row[c] for c in _ablation_cols]
-        _color = plt.cm.RdYlGn((_row["best_val_f1"] - _f1_min) / _f1_range)
-        _ax5.plot(range(len(_ablation_cols)), _vals, color=_color, alpha=0.3, linewidth=0.5)
-    _ax5.set_xticks(range(len(_ablation_cols)))
-    _ax5.set_xticklabels(_ablation_cols, rotation=30, ha="right")
-    for _col, _enc in _pc_enc.items():
-        _xi = _ablation_cols.index(_col)
-        for _k, _v in _enc.items():
-            _ax5.annotate(_k, (_xi, _v), textcoords="offset points",
-                          xytext=(8, 0), fontsize=6, ha="left")
-    _ax5.set_ylabel("Option Index")
-    _ax5.set_ylim(-0.5, max(len(v) for v in _pc_enc.values()) - 0.5)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig(os.path.join(ABLATION_DIR, "parallel_coordinates.png"), dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: parallel_coordinates.png")
+        # --- Save histories to JSON ---
+        with open(os.path.join(ABLATION_DIR, "ablation_histories.json"), "w") as _f:
+            json.dump(ablation_histories, _f)
+        print(f"Histories saved to {ABLATION_DIR}/ablation_histories.json")
 
-    # --- Summary ---
-    print("\n" + "=" * 70)
-    print("ABLATION STUDY COMPLETE")
-    print("=" * 70)
-    print(f"Total configurations tested: {_ablation_total}")
-    print(f"\nBest configuration:")
-    _best_row = results_sorted.iloc[0]
-    for _col in _ablation_cols:
-        print(f"  {_col:>15}: {_best_row[_col]}")
-    print(f"  {'best_val_f1':>15}: {_best_row['best_val_f1']:.4f}")
-    print(f"  {'best_val_acc':>15}: {_best_row['best_val_acc']:.4f}")
-    print(f"\nAll artifacts saved to: {ABLATION_DIR}/")
-    print("  - ablation_results.csv")
-    print("  - ablation_histories.json")
-    print("  - component_importance.png")
-    print("  - f1_boxplots.png")
-    print("  - pairwise_heatmaps.png")
-    print("  - top10_curves.png")
-    print("  - parallel_coordinates.png")
+        # --- Results table ---
+        results_sorted = results_df.sort_values("best_val_f1", ascending=False).reset_index(drop=True)
+        print("\n" + "=" * 130)
+        print("ABLATION STUDY RESULTS -- sorted by best Val F1 (top 30 shown)")
+        print("=" * 130)
+        print(results_sorted.head(30).to_string(index=False))
+        print("=" * 130)
 
-    # Display full sorted results as interactive table
-    results_sorted
+        # --- Visualisation 1: Component importance bar charts ---
+        _fig1, _axes1 = plt.subplots(2, 4, figsize=(24, 10))
+        _fig1.suptitle("Ablation -- Mean Best Val F1 by Component Option", fontsize=14, fontweight="bold")
+        for _ax, _col in zip(_axes1.flat, _ablation_cols):
+            _means = results_df.groupby(_col)["best_val_f1"].mean().sort_values(ascending=False)
+            _bars = _ax.bar(range(len(_means)), _means.values, color="steelblue", edgecolor="black")
+            _ax.set_xticks(range(len(_means)))
+            _ax.set_xticklabels(_means.index, rotation=30, ha="right")
+            _ax.set_ylabel("Mean Best Val F1")
+            _ax.set_title(_col)
+            for _bar, _val in zip(_bars, _means.values):
+                _ax.text(_bar.get_x() + _bar.get_width() / 2, _bar.get_height() + 0.001,
+                         f"{_val:.4f}", ha="center", va="bottom", fontsize=9)
+            _ax.set_ylim(_means.min() - 0.02, _means.max() + 0.02)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(os.path.join(ABLATION_DIR, "component_importance.png"), dpi=150, bbox_inches="tight")
+        plt.show()
+        print("Saved: component_importance.png")
 
+        # --- Visualisation 2: Box plots of F1 distribution by component ---
+        _fig2, _axes2 = plt.subplots(2, 4, figsize=(24, 10))
+        _fig2.suptitle("Ablation -- Best Val F1 Distribution by Component", fontsize=14, fontweight="bold")
+        for _ax, _col in zip(_axes2.flat, _ablation_cols):
+            _groups = [results_df[results_df[_col] == v]["best_val_f1"].values
+                       for v in results_df[_col].unique()]
+            _labels = list(results_df[_col].unique())
+            _bp = _ax.boxplot(_groups, tick_labels=_labels, patch_artist=True)
+            for _patch in _bp["boxes"]:
+                _patch.set_facecolor("lightblue")
+                _patch.set_alpha(0.7)
+            _ax.set_ylabel("Best Val F1")
+            _ax.set_title(_col)
+            _ax.tick_params(axis="x", rotation=30)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(os.path.join(ABLATION_DIR, "f1_boxplots.png"), dpi=150, bbox_inches="tight")
+        plt.show()
+        print("Saved: f1_boxplots.png")
+
+        # --- Visualisation 3: Pairwise heatmaps ---
+        _fig3, _axes3 = plt.subplots(1, 3, figsize=(21, 6))
+        _fig3.suptitle("Ablation -- Pairwise Component Interactions (Mean Best Val F1)",
+                       fontsize=14, fontweight="bold")
+        _pairs = [("attention", "activation"), ("norm", "pooling"), ("warmup", "optimizer")]
+        for _ax, (_c1, _c2) in zip(_axes3, _pairs):
+            _pivot = results_df.pivot_table(values="best_val_f1", index=_c1, columns=_c2, aggfunc="mean")
+            _im = _ax.imshow(_pivot.values, cmap="YlOrRd", aspect="auto")
+            _ax.set_xticks(range(len(_pivot.columns)))
+            _ax.set_xticklabels(_pivot.columns, rotation=30, ha="right")
+            _ax.set_yticks(range(len(_pivot.index)))
+            _ax.set_yticklabels(_pivot.index)
+            _ax.set_xlabel(_c2)
+            _ax.set_ylabel(_c1)
+            _ax.set_title(f"{_c1} x {_c2}")
+            for _r in range(len(_pivot.index)):
+                for _c in range(len(_pivot.columns)):
+                    _ax.text(_c, _r, f"{_pivot.values[_r, _c]:.4f}",
+                             ha="center", va="center", fontsize=11, fontweight="bold")
+            _fig3.colorbar(_im, ax=_ax, shrink=0.8)
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        plt.savefig(os.path.join(ABLATION_DIR, "pairwise_heatmaps.png"), dpi=150, bbox_inches="tight")
+        plt.show()
+        print("Saved: pairwise_heatmaps.png")
+
+        # --- Visualisation 4: Top-10 training curves ---
+        _top10 = results_sorted.head(10)
+        _fig4, _axes4 = plt.subplots(1, 2, figsize=(16, 6))
+        _fig4.suptitle("Top-10 Configurations -- Training Curves", fontsize=14, fontweight="bold")
+        for _, _row in _top10.iterrows():
+            _name = "|".join(str(_row[c]) for c in _ablation_cols)
+            _h = ablation_histories[_name]
+            _axes4[0].plot(_h["train_loss"], label=_name, alpha=0.8)
+            _axes4[1].plot(_h["val_f1"], label=_name, alpha=0.8, marker="o")
+        _axes4[0].set_title("Training Loss")
+        _axes4[0].set_xlabel("Epoch")
+        _axes4[0].set_ylabel("Loss")
+        _axes4[0].legend(fontsize=6, loc="upper right")
+        _axes4[1].set_title("Validation F1")
+        _axes4[1].set_xlabel("Epoch")
+        _axes4[1].set_ylabel("F1")
+        _axes4[1].legend(fontsize=6, loc="lower right")
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        plt.savefig(os.path.join(ABLATION_DIR, "top10_curves.png"), dpi=150, bbox_inches="tight")
+        plt.show()
+        print("Saved: top10_curves.png")
+
+        # --- Visualisation 5: Parallel coordinates ---
+        _fig5, _ax5 = plt.subplots(figsize=(18, 8))
+        _fig5.suptitle("Ablation -- Parallel Coordinates (coloured by Best Val F1)",
+                       fontsize=14, fontweight="bold")
+        _pc_data = results_df[_ablation_cols + ["best_val_f1"]].copy()
+        _pc_enc = {}
+        for _col in _ablation_cols:
+            _vals = sorted(_pc_data[_col].unique())
+            _pc_enc[_col] = {v: i for i, v in enumerate(_vals)}
+            _pc_data[_col] = _pc_data[_col].map(_pc_enc[_col])
+
+        _f1_min = results_df["best_val_f1"].min()
+        _f1_max = results_df["best_val_f1"].max()
+        _f1_range = _f1_max - _f1_min + 1e-8
+        for _, _row in _pc_data.iterrows():
+            _vals = [_row[c] for c in _ablation_cols]
+            _color = plt.cm.RdYlGn((_row["best_val_f1"] - _f1_min) / _f1_range)
+            _ax5.plot(range(len(_ablation_cols)), _vals, color=_color, alpha=0.3, linewidth=0.5)
+        _ax5.set_xticks(range(len(_ablation_cols)))
+        _ax5.set_xticklabels(_ablation_cols, rotation=30, ha="right")
+        for _col, _enc in _pc_enc.items():
+            _xi = _ablation_cols.index(_col)
+            for _k, _v in _enc.items():
+                _ax5.annotate(_k, (_xi, _v), textcoords="offset points",
+                              xytext=(8, 0), fontsize=6, ha="left")
+        _ax5.set_ylabel("Option Index")
+        _ax5.set_ylim(-0.5, max(len(v) for v in _pc_enc.values()) - 0.5)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(os.path.join(ABLATION_DIR, "parallel_coordinates.png"), dpi=150, bbox_inches="tight")
+        plt.show()
+        print("Saved: parallel_coordinates.png")
+
+        # --- Summary ---
+        print("\n" + "=" * 70)
+        print("ABLATION STUDY COMPLETE")
+        print("=" * 70)
+        print(f"Total configurations tested: {_ablation_total}")
+        print(f"\nBest configuration:")
+        _best_row = results_sorted.iloc[0]
+        for _col in _ablation_cols:
+            print(f"  {_col:>15}: {_best_row[_col]}")
+        print(f"  {'best_val_f1':>15}: {_best_row['best_val_f1']:.4f}")
+        print(f"  {'best_val_acc':>15}: {_best_row['best_val_acc']:.4f}")
+        print(f"\nAll artifacts saved to: {ABLATION_DIR}/")
+        print("  - ablation_results.csv")
+        print("  - ablation_histories.json")
+        print("  - component_importance.png")
+        print("  - f1_boxplots.png")
+        print("  - pairwise_heatmaps.png")
+        print("  - top10_curves.png")
+        print("  - parallel_coordinates.png")
+
+        # Display full sorted results as interactive table
+        results_sorted
     return
 
 
