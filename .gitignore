@@ -3,3 +3,8 @@ __marimo__/
 .git/
 
 .env
+
+# The ablation resume store: regenerable, and it grows to ~1 GB once the 93-run
+# grid has completed (one ~10 MB state_dict per configuration). The curated export it
+# mirrors lives in results_export/, which is tracked instead.
+ablation_cache/
