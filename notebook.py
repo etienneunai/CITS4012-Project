@@ -34,13 +34,36 @@ def hyperparameters():
     _NOTEBOOK_DIR = str(_mo.notebook_dir() or _os.getcwd())
 
     # --- Data & tokenization ---
-    MIN_FREQ = 1              # drop words seen fewer than this many times
+    # Every train word is kept: raising this can only make token-level OOV worse, and
+    # 7.8% of test tokens are already unseen in the train vocabulary.
+    MIN_FREQ = 1
+    # Encoder budgets, set from the MultiRC token-length distribution (train split,
+    # 27,243 answer instances; tokens are lowercase `\w+` with punctuation dropped, see
+    # the `tokenizer` cell). Passage: mean 283, p50 279, p90 423, p95 446, p99 504,
+    # max 574 -- so 448 sits at the 95th percentile and only 3.7% of instances are
+    # truncated at all. Of those few, the head+tail window still holds the evidence
+    # sentence for 96.7% of correct answers (head-only 62.3%, tail-only 32.9%, both
+    # 1.5%; the dropped middle loses 3.3%).
     PASSAGE_MAX_TOKENS = 448
-    QUESTION_MAX_TOKENS = 32
-    ANSWER_MAX_TOKENS = 28
-    QA_MAX_TOKENS = 96
+    QUESTION_MAX_TOKENS = 32  # question mean 11.4 / p95 21 tokens: truncates 0.17%
+    ANSWER_MAX_TOKENS = 28    # answer mean 4.7 / p95 15 tokens: truncates 0.83%
+    QA_MAX_TOKENS = 96        # safety cap only: 32 + 1 + 28 + 1 = 62, so never binds
     BATCH_SIZE = 64
-    NUM_WORKERS = 0           # DataLoader workers; 0 = batching on the main thread
+    NUM_WORKERS = 0           # DataLoader workers. Padding and collate run off the main
+                              # thread, so they overlap the GPU step instead of blocking it --
+                              # but only if the workers can start at all. This notebook defines
+                              # the dataset and `collate_batch` in a cell, so a worker that is
+                              # not forked re-imports `__main__` -- the notebook launcher, not
+                              # this notebook -- and cannot resolve them while unpickling: spawn
+                              # raises `AttributeError: Can't get attribute 'MultiRCDataset' on
+                              # <module '__mp_main__'>` and the parent dies with
+                              # `BrokenPipeError` before the first batch. `_loader_workers` in
+                              # the `dataset` cell carries the detail and forces 0 for any value
+                              # that cannot work, so leave this at 0 while the dataset and the
+                              # collate function are defined in cells. Numerically inert either
+                              # way: the dataset is pre-tokenised, collate is a pure function,
+                              # and the batch order comes from the sampler in the main process,
+                              # so runs are bit-for-bit unchanged.
     VAL_FRACTION = 0.18
     SEED = 42
 
@@ -76,7 +99,12 @@ def hyperparameters():
     DROPOUT = 0.2
 
     # --- Optimisation ---
-    NUM_EPOCHS = 25
+    # The budget *is* the LR schedule's horizon: `lr_for_epoch` anneals the cosine over
+    # `num_epochs`, so the budget has to sit near where early stopping actually fires.
+    # At 25 with patience 5 the runs stopped around epoch 7 with the LR still at ~93% of
+    # its peak, so the cosine never annealed and the selected checkpoint was a
+    # mid-schedule one. 12 lets the anneal land inside the run.
+    NUM_EPOCHS = 12
     LR = 3e-4                 # short warmup, then cosine decay
     LR_WARMUP_EPOCHS = 2
     LR_DECAY = "cosine"       # cosine | constant
@@ -87,10 +115,22 @@ def hyperparameters():
 
     # --- Checkpoint selection ---
     # Select on *within-question* ranking, the comparison MultiRC's metrics use.
-    EARLY_STOP_METRIC = "val_q_auc"   # val_q_auc | val_q_ap | val_ap | val_q_f1 | val_loss | val_auc | val_f1
+    # Within-question AUC is the right *kind* of selection signal for MultiRC: every
+    # question has a different number of correct answers, so a fixed global cut is
+    # inappropriate, and the threshold-free within-question ranking is what the
+    # per-question metrics rest on. It is also the only *stable* one -- per-question F1
+    # on ~860 validation questions jitters ~0.03-0.08 epoch to epoch, against ~0.004 for
+    # the AUC. `val_q_f1_declared` (the reported operating point, now recorded every
+    # epoch) is available here if you ever want to select on the exact number the report
+    # leads with instead.
+    EARLY_STOP_METRIC = "val_q_auc"   # val_q_auc | val_q_ap | val_ap | val_q_f1 | val_loss | val_auc | val_f1 | val_q_f1_declared
     EARLY_STOPPING = True
     EARLY_STOP_PATIENCE = 5
-    EARLY_STOP_MIN_DELTA = 0.010   # above the epoch-to-epoch jitter, so a wobble is not a "best"
+    # Must sit *below* the selection metric's epoch-to-epoch movement (~0.004 on
+    # val_q_auc). At 0.010 the "improved" test swallowed the genuine gains and 15 of 19
+    # runs reported an epoch that was not the argmax -- by up to 0.008 of AUC, which is
+    # most of the difference the ablation is trying to measure.
+    EARLY_STOP_MIN_DELTA = 0.001
     EARLY_STOP_MIN_EPOCHS = 4      # never stop inside the warmup / early annealing
 
     # --- Decision threshold ---
@@ -117,24 +157,40 @@ def hyperparameters():
     N_ATTENTION_EXAMPLES = 2   # attention figures: one question right, one wrong
     N_ATTENTION_SCAN = 120     # test questions scanned for the attention evidence
 
-    # --- Section 4: final grid (encoder x attention x pooling) ---
+    # --- Section 4: the two ablation studies ---------------------------------------------
+    # There are exactly two, and they differ only in budget and seed count:
+    #
+    #   QUICK_ABLATION      -- a one-change-at-a-time SCREEN on a shortened budget and a
+    #                          single seed, for ballpark triage. Its runs are tagged
+    #                          kind="screen", so the plots show them but no reported table,
+    #                          no diagnostic and no model-vs-baseline row does.
+    #   RUN_ABLATION_STUDY  -- the FINAL, reported study: the full budget over
+    #                          ABLATION_SEEDS, covering the architecture factorial
+    #                          (ENCODER_OPTIONS x ATTENTION_OPTIONS x POOLING_OPTIONS) *and*
+    #                          every COMPONENT_VARIANTS entry (head, objective, passage
+    #                          truncation, passage encoder, cross-attention direction,
+    #                          question/answer pooling, dropout, pairwise weight and the
+    #                          alignment features). The component list is in the
+    #                          `ablation_components` cell; both studies read it, so the
+    #                          screen and the final study can never drift apart.
     RUN_ABLATION_STUDY = False
     ENCODER_OPTIONS = ["two_tower", "single"]
     ATTENTION_OPTIONS = ["self", "cross", "inter", "none"]
     POOLING_OPTIONS = ["final", "mean", "max", "attention"]
 
-    # --- Section 4: targeted quick screen ---
-    # One-change-at-a-time runs on a shortened budget; a screen, not a result.
+    # The quick screen, and its shortened budget. A screen, not a result.
     QUICK_ABLATION = True
-    QUICK_ABLATION_EPOCHS = 15
+    QUICK_ABLATION_EPOCHS = 8
 
-    # --- Section 4: final ablation budget ---
-    ABLATION_EPOCHS = 25           # ceiling; EARLY_STOPPING ends most runs at 6-10
-    ABLATION_SEEDS = [42, 43, 44]  # includes SEED, so the grid subsumes the configured run
+    # --- Section 4: the final study's budget and seeds ---
+    ABLATION_EPOCHS = 12           # ceiling *and* the cosine's horizon: early stopping
+                                   # ends most runs at ~7, with the LR then down to ~20%
+                                   # of its peak instead of ~93%
+    ABLATION_SEEDS = [42, 43, 44]  # includes SEED, so the study subsumes the configured run
     ABLATION_CACHE_DIR = _os.path.join(_NOTEBOOK_DIR, "ablation_cache")
 
-    # --- Section 4: component ablation (head x objective) ---
-    RUN_COMPONENT_ABLATION = False
+    # The head and the objective axes. Every value except the configured one becomes a
+    # component run in the final study (and a screen row in the quick one).
     HEAD_OPTIONS = ["interaction", "concat", "compare", "match"]
     LOSS_OPTIONS = ["within_question", "bce"]
 
@@ -235,7 +291,6 @@ def hyperparameters():
         REPORT_SWEEP_DIAGNOSTIC,
         RESULTS_DIR,
         RUN_ABLATION_STUDY,
-        RUN_COMPONENT_ABLATION,
         RUN_EMBEDDING_BIGRU_BASELINES,
         RUN_PRETRAINED_BASELINES,
         SAMPLE_SEED,
@@ -388,10 +443,23 @@ def _():
 @app.cell
 def tokenizer(re):
     # --- Tokenization ------------------------------------------------------------
-    TOKEN_RE = re.compile(r"\w+|[^\w\s]")
+    # Word-level, punctuation dropped. Punctuation was 13.6% of every token in this corpus
+    # (`.` and `,` alone were 9.5%), and emitting each mark as its own token spent that much of
+    # the PASSAGE_MAX_TOKENS budget on nothing: dropping it shortens an encoded passage by ~13%
+    # while leaving the signal the model actually uses unchanged -- the passage-overlap feature
+    # `_passage_match_features` computes moves by +0.0015 within-question AUC over 942 test
+    # questions, 95% CI [-0.0014, +0.0045], i.e. inside noise.
+    #
+    # Stop words are deliberately *kept*. Removing them would halve the sequence length, but it
+    # measurably degrades that same overlap feature (-0.0155, 95% CI [-0.0291, -0.0014]), and
+    # the ablation shows the overlap features are the model's dominant mechanism
+    # (`no_match_features` is the largest single effect in the screen, -0.073 qAUC). Trading
+    # the signal that works for speed is the wrong trade.
+    TOKEN_RE = re.compile(r"\w+")
 
 
     def tokenize(text):
+        """Lowercase word tokens; punctuation is dropped, not emitted as its own token."""
         return TOKEN_RE.findall(text.lower())
 
 
@@ -424,6 +492,8 @@ def dataset(
     tokenize,
     train_data,
 ):
+    import multiprocessing
+
     import torch
     from torch.utils.data import Dataset, DataLoader
     from collections import Counter
@@ -590,6 +660,56 @@ def dataset(
     _val_examples = [flat_train[_i] for _k in _passage_keys if _k in _val_keys for _i in _passages[_k]]
 
 
+    _WORKER_NOTICE_SHOWN = [False]
+
+
+    def _loader_workers(num_workers=NUM_WORKERS):
+        """Worker count for the DataLoaders, forced to 0 when the workers could not start.
+
+        `MultiRCDataset` and `collate_batch` are defined in this notebook, so they live in the
+        running `__main__`. A worker that is not *forked* -- one started by `spawn` (this
+        kernel's start method) or `forkserver` -- does not inherit this notebook's globals: it
+        re-imports `__main__`, which is the notebook *launcher*, not this notebook, and then
+        fails to resolve the names it was handed while unpickling. The parent's iterator dies
+        with `AttributeError: Can't get attribute 'MultiRCDataset' on <module '__mp_main__'>`
+        / `BrokenPipeError` before the first batch is ever produced. Such workers need the
+        dataset and the collate function to come from a real importable module, and here they
+        do not, so the loaders run in the main process instead. That costs little: the dataset
+        pre-tokenises in `MultiRCDataset.__init__` and `collate_batch` only pads a batch, so
+        Python-side loading is far from the bottleneck. `fork` would keep the workers alive,
+        but this kernel has CUDA initialised and runs cells off the main thread, which is
+        precisely what fork is unsafe with.
+
+        Workers would not be worth having here even if they started. Measured on this machine,
+        the configured model (d_model 128, 1 BiGRU layer, 2.65M params, `interaction` head) at
+        the configured shapes: fetching and collating a 64-item batch in-process costs 2.0 ms,
+        and one forward+backward+optimiser step costs 39 ms on the GPU -- so the host work is
+        4.8% of a batch, and a full 358-batch epoch would go from 14.6 s to 13.9 s with
+        *perfect* overlap. Against that, four `spawn` workers take ~12 s to serve their first
+        batch in this environment (each one re-imports torch and the notebook launcher), paid
+        once per loader -- and `build_loaders` builds three of them. Trading a ~5% ceiling for
+        minutes of process startup is the wrong way round, which is why NUM_WORKERS is 0.
+
+        Any `num_workers > 0` that cannot work is downgraded to 0, so raising NUM_WORKERS in
+        the hyperparameters cell can never break a run this way again -- it prints one line the
+        first time it has to, so the downgrade is not silent.
+        """
+        if not num_workers:
+            return 0
+        _defined_in_a_cell = (MultiRCDataset.__module__ == "__main__"
+                              or collate_batch.__module__ == "__main__")
+        if _defined_in_a_cell and multiprocessing.get_start_method() != "fork":
+            if not _WORKER_NOTICE_SHOWN[0]:
+                _WORKER_NOTICE_SHOWN[0] = True
+                print(f"NOTE: NUM_WORKERS={num_workers} cannot be honoured here -- the dataset and "
+                      f"`collate_batch` are defined in this notebook, and a "
+                      f"{multiprocessing.get_start_method()!r} worker copies its arguments by "
+                      f"reference instead of inheriting them, so it cannot import them. Loading "
+                      f"in-process instead; see `_loader_workers` for the measurements.")
+            return 0
+        return num_workers
+
+
     def build_loaders(truncation=PASSAGE_TRUNCATION):
         """(Re)build the train/val/test datasets and loaders for a truncation mode.
 
@@ -599,9 +719,13 @@ def dataset(
         train_ds = MultiRCDataset(_train_examples, truncation)
         val_ds = MultiRCDataset(_val_examples, truncation)
         test_ds = MultiRCDataset(flat_test, truncation)
-        _loader_kwargs = {"num_workers": NUM_WORKERS,
+        # 0 workers means no pickling at all: the dataset, the collate function and the
+        # batch sampler are used in this process, which is what `_loader_workers`
+        # falls back to when the configured workers could not start.
+        _workers = _loader_workers()
+        _loader_kwargs = {"num_workers": _workers,
                           "pin_memory": torch.cuda.is_available(),
-                          "persistent_workers": NUM_WORKERS > 0}
+                          "persistent_workers": _workers > 0}
         # The training loader is the only one that needs to group by question.
         if GROUPED_BATCHES:
             _train_loader = DataLoader(
@@ -619,7 +743,7 @@ def dataset(
 
     train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader = build_loaders()
 
-    print(f"Tuples: {len(train_dataset)} train / {len(val_dataset)} val / {len(test_dataset)} test")
+    print(f"Tuples: {len(train_dataset)} train / {len(val_dataset)} val / {len(test_dataset)} test | DataLoader workers: {train_loader.num_workers}")
 
     # --- Class imbalance ---------------------------------------------------------
     # The skew is handled by *declaring* the cut on validation, not by also weighting the
@@ -658,8 +782,9 @@ def _(mo):
     mo.md(r"""
     ## Tokenization & Encoding
 
-    A word-level tokenizer: a regex splits text into words and punctuation, and the
-    vocabulary is built from the training tuples (`MIN_FREQ` drops rare words). Each
+    A word-level tokenizer: a regex takes lowercase word tokens and drops punctuation
+    (stop words are kept -- see the `tokenizer` cell), and the vocabulary is built from
+    the training tuples (`MIN_FREQ` drops rare words). Each
     example feeds up to **two** encoder inputs:
 
     ```
@@ -1321,21 +1446,28 @@ def _(
         labels, scores, qids = [], [], []
         total_loss, num_batches = 0.0, 0
 
+        # Keep the split's logits on the GPU and hop to the host once, instead of
+        # syncing (`.cpu().tolist()`, `.item()`) on every batch.
+        _logits, _labels, _qids = [], [], []
         with torch.no_grad():
             for passage_ids, qa_ids, targets, batch_qids in data_loader:
-                passage_ids = passage_ids.to(DEVICE)
-                qa_ids = qa_ids.to(DEVICE)
-                targets = targets.to(DEVICE)
+                passage_ids = passage_ids.to(DEVICE, non_blocking=True)
+                qa_ids = qa_ids.to(DEVICE, non_blocking=True)
+                targets = targets.to(DEVICE, non_blocking=True)
                 logits = model(passage_ids, qa_ids)
-                total_loss += criterion(logits, targets).item()
+                total_loss = total_loss + criterion(logits, targets).detach()
                 num_batches += 1
-                scores.extend(torch.sigmoid(logits).cpu().tolist())
-                labels.extend(targets.long().tolist())
-                qids.extend(batch_qids.tolist())
+                _logits.append(logits.detach())
+                _labels.append(targets.detach())
+                _qids.append(batch_qids)
+        if _logits:
+            scores = torch.sigmoid(torch.cat(_logits)).cpu().tolist()
+            labels = torch.cat(_labels).long().cpu().tolist()
+            qids = torch.cat(_qids).tolist()
 
         preds = [int(_s > threshold) for _s in decision_scores(scores, qids, rule)]
         metrics = {
-            "loss": total_loss / max(num_batches, 1),
+            "loss": float(total_loss / max(num_batches, 1)),
             "rule": rule,
             "acc": accuracy_score(labels, preds),
             "yes_rate": sum(preds) / max(len(preds), 1),
@@ -1580,9 +1712,11 @@ def _(
         history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [],
                    "val_auc": [], "val_ap": [], "val_q_em": [], "val_q_f1": [],
                    "val_q_auc": [], "val_q_ap": [], "lr": [],
+                       "val_q_f1_declared": [],
                    "best_epoch": None, "best_score": None,
                    "best_val_ap": None, "best_val_q_f1": None, "best_val_auc": None,
                    "best_val_f1": None, "best_val_q_auc": None, "best_val_q_ap": None,
+                       "best_val_q_f1_declared": None,
                    "stopped_epoch": None, "epochs_run": None, "budget": num_epochs,
                    "early_stopping": bool(early_stopping),
                    "loss_name": loss, "pairwise_weight": pairwise_weight,
@@ -1610,10 +1744,10 @@ def _(
             pbar = tqdm(train_loader, desc=f"[{label}] epoch {epoch+1}/{num_epochs}",
                         leave=False)
             for passage_ids, qa_ids, targets, batch_qids in pbar:
-                passage_ids = passage_ids.to(DEVICE)
-                qa_ids = qa_ids.to(DEVICE)
-                targets = targets.to(DEVICE)
-                batch_qids = batch_qids.to(DEVICE)
+                passage_ids = passage_ids.to(DEVICE, non_blocking=True)
+                qa_ids = qa_ids.to(DEVICE, non_blocking=True)
+                targets = targets.to(DEVICE, non_blocking=True)
+                batch_qids = batch_qids.to(DEVICE, non_blocking=True)
 
                 optimizer.zero_grad()
                 logits = model(passage_ids, qa_ids)
@@ -1626,14 +1760,30 @@ def _(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
 
-                total_loss += batch_loss.item()
+                # Accumulate on the GPU: `.item()` forces a device sync, so pay for it
+                # once per epoch rather than twice per batch. `total_loss` is a tensor
+                # here and is read with the single float() below.
+                total_loss = total_loss + batch_loss.detach()
                 num_batches += 1
-                pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
+                if num_batches % 20 == 0:   # bar kept; only the postfix is throttled
+                    pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
 
-            train_loss = total_loss / max(num_batches, 1)
+            train_loss = float(total_loss / max(num_batches, 1))
             # The per-epoch curve is read at a fixed cut on the raw scores so the epochs
             # stay comparable; the reported numbers use the run's declared rule.
             val = evaluate(model, val_loader, rule="prior_match")
+
+            # The operating point the *report* uses: the declared cut (prior-matched, on
+            # within-question-centred scores -- see `declared_threshold`), not the arbitrary
+            # 0.5 cut the curves above are read at. It costs no extra forward pass (`val`
+            # already carries labels/scores/qids), and it makes the trajectory of the metric
+            # we report visible -- so `EARLY_STOP_METRIC` can be pointed at the reported
+            # number if ranking and calibration ever disagree.
+            _cut = declared_threshold(val["labels"], val["scores"], val["qids"])
+            _declared_preds = [int(_s > _cut) for _s in
+                               decision_scores(val["scores"], val["qids"], THRESHOLD_RULE)]
+            val["q_f1_declared"] = per_question_metrics(
+                val["qids"], val["labels"], _declared_preds)["q_f1"]
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val["loss"])
@@ -1645,11 +1795,13 @@ def _(
             history["val_q_f1"].append(val["q_f1"])
             history["val_q_auc"].append(val["q_auc"])
             history["val_q_ap"].append(val["q_ap"])
+            history["val_q_f1_declared"].append(val["q_f1_declared"])
             history["lr"].append(current_lr)
 
             print(f"[{label}] epoch {epoch+1}: train_loss={history['train_loss'][-1]:.4f} "
                   f"val_loss={val['loss']:.4f} val_ap={val['ap']:.4f} "
                   f"val_q_f1={val['q_f1']:.4f} val_auc={val['auc']:.4f} "
+                  f"q_f1@declared={val['q_f1_declared']:.4f} "
                   f"lr={current_lr:.2e}")
 
             score = val[metric_key[4:]]
@@ -1663,6 +1815,7 @@ def _(
                 history["best_val_f1"] = val["f1"]
                 history["best_val_q_auc"] = val["q_auc"]
                 history["best_val_q_ap"] = val["q_ap"]
+                history["best_val_q_f1_declared"] = val["q_f1_declared"]
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 epochs_without_improvement = 0
             else:
@@ -3637,7 +3790,6 @@ def _(
                     if _token not in vocab:
                         _counts[_field][0] += 1
         unk_rates[_split_name] = _counts
-
     return (
         answer_word_counts,
         answers_per_question,
@@ -3819,22 +3971,24 @@ def _(mo):
     mo.md(r"""
     ## 4. Ablation study
 
-    Four cells, split by cost:
+    Two studies sharing one component list (the `ablation_components` cell), so they cannot
+    drift apart. They differ only in budget and in how many seeds they repeat:
 
-    - **`quick_ablation`** -- a one-change-at-a-time screen on a shortened budget, for
-      iterating. It is a screen, not a result.
-    - **the grid cell below** -- the final ablation, in two parts: every `ENCODER_OPTIONS` x
-      `ATTENTION_OPTIONS` x `POOLING_OPTIONS` architecture the encoder admits (with the shipped
-      options that is 6 encoder x attention combinations x 4 poolings = 24 runs), plus a
-      `HEAD_OPTIONS` x `LOSS_OPTIONS` factorial, each repeated over `ABLATION_SEEDS`.
-    - **the summary table** -- aggregates the grid and the baselines into one table.
+    - **`quick_ablation`** (`QUICK_ABLATION`) -- a one-change-at-a-time **screen** on a
+      shortened budget (`QUICK_ABLATION_EPOCHS`) and a single seed, for ballpark triage: which
+      variants look worth a full-budget run, and which are dead on arrival. Its runs are tagged
+      `kind="screen"`, so the plots show them but **no reported table, no diagnostic and no
+      model-vs-baselines row does**. It is a screen, not a result.
+    - **`final_ablation`** (`RUN_ABLATION_STUDY`) -- the **reported** study, at
+      `ABLATION_EPOCHS` over `ABLATION_SEEDS`, covering every component.
+    - **the summary table** -- aggregates the reported runs and the baselines into one table.
     - **the model-vs-baselines comparison** -- the same numbers as bars, with a
       passage-bootstrap interval and a paired test against each baseline.
 
     All of them register their runs in `experiments`/`models`/`test_loaders`, so the plots,
-    the sample-answer cell and the summary table pick them up.
+    the sample-answer cell, the attention figures and the summary table pick them up.
 
-    ### The final grid
+    ### The final study
 
     This is the comparison the report is built on, so it is controlled:
 
@@ -3846,172 +4000,239 @@ def _(mo):
       same epoch as one that ran on, and the comparison stays like-for-like.
     - **Repeated over seeds, seeds outermost.** `ABLATION_SEEDS` runs each configuration
       several times, so the spread *between* configurations can be read against the spread
-      *within* one. The seed loop is on the outside, so the grid is already comparable after
+      *within* one. The seed loop is on the outside, so the study is already comparable after
       the first pass. The summary prints the means and the seed spread, and the diagnostics
       cell prints a paired-by-seed comparison: a difference that keeps its sign across every
       shared seed is separated by these runs, one that flips is noise.
-    - **What it varies.** The four `POOLING_OPTIONS` are compared against each other (`mean`
-      dilutes a 448-token passage into one vector; `max` and `attention` keep the per-position
-      signal the head needs to locate the evidence); `ATTENTION_OPTIONS` includes `"none"`, so
-      the attention mechanism itself is controlled rather than assumed; and `single` is the
-      two-tower split's baseline.
-    - **What it holds fixed.** The head and the objective are the configured `HEAD`/`LOSS` for
-      every architecture run, so the architecture axis is not confounded with them. They are
-      ablated separately, below. `HEAD` here has to be a head that keeps the pooled vectors in
-      the classifier (`interaction`, `compare` or `concat`): under `head="match"` the
-      classifier reads *only* the alignment features, so `POOLING`/`QA_POOLING` cannot change
-      the run at all and the pooling axis would be several copies of one run. The shipped
-      configuration is therefore `HEAD = "interaction"`, and the grid refuses the `"match"`
-      combination by name rather than printing a table of identical rows.
-    - The configured model (`ENCODER`/`ATTENTION`/`POOLING` in the hyperparameters cell) is one
-      member of the grid, so its row is not a separate experiment. Set those three to the
-      grid's best configuration once the grid has run.
+    - **Two blocks, covering every component.** The **architecture factorial** sweeps every
+      `ENCODER_OPTIONS` x `ATTENTION_OPTIONS` x `POOLING_OPTIONS` architecture the encoder
+      admits (with the shipped options, 6 encoder x attention combinations x 4 poolings = 24).
+      Those three interact, so they are swept together as a cross product. The **component
+      runs** then change exactly one thing at a time off the configured model, covering
+      everything the factorial holds fixed: the head, the objective, the passage truncation,
+      the passage encoder, the cross-attention direction, the question/answer pooling,
+      dropout, the pairwise weight and the alignment features -- every entry of
+      `COMPONENT_VARIANTS` in the `ablation_components` cell.
+    - **A reference that costs nothing.** The configured model
+      (`ENCODER`/`ATTENTION`/`POOLING` in the hyperparameters cell) is itself a member of the
+      architecture factorial, so every component run has a full-budget, same-seed reference
+      already trained. The summary and the diagnostics compare them **paired seed by seed**,
+      which cancels the seed effect and is the sensitive test. Set those three to the
+      factorial's best configuration once the study has run.
+    - **The `"match"` guard.** The architecture axis is swept under the configured `HEAD`, and
+      `HEAD` has to keep the pooled vectors in the classifier for the `POOLING` axis to be
+      measurable: under `head="match"` the classifier reads *only* the alignment features, so
+      every pooling setting would build the same function and the pooling axis would be
+      several copies of one run. The shipped configuration is therefore `HEAD = "interaction"`,
+      and the study refuses the `"match"` combination by name rather than printing a table of
+      identical rows. `head="match"` is still ablated -- as a *component*, where it is the
+      extreme that closes the answer-prior route by construction.
 
-    ### The head x objective ablation
+    ### Reading a component
 
-    `RUN_COMPONENT_ABLATION` adds a `len(HEAD_OPTIONS)` x `len(LOSS_OPTIONS)` factorial over the
-    two knobs that change what the model *learns*, with the architecture held at the configured
-    trio (that is 7 extra configurations per seed; the eighth cell of the factorial is the
-    architecture grid's own row):
-
-    - `HEAD` -- what the classifier is fed. `concat` gives it the two pooled vectors
+    - **head** -- what the classifier is fed. `concat` gives it the two pooled vectors
       (`[u; v]`); `interaction` adds the comparison (`[u; v; |u-v|; u*v]`); `compare` drops the
       bare vectors and keeps only terms that contain the passage (`[|u-v|; u*v]`); and `match`
       hands it *only* the passage-conditioned alignment features, so nothing in its input is
-      computable from the question and answer alone. All four are ablated, because they differ
-      in how much of the answer <-> passage comparison reaches the classifier, and `match` is
-      the extreme that closes the answer-prior route by construction -- at the cost of the
-      pooled vectors, and therefore of the pooling axis.
-    - `LOSS` -- `bce` against `within_question`, which centres each question's candidate logits
-      on their own mean and adds a pairwise ranking term (`PAIRWISE_WEIGHT`). The level of a
-      question is a property of a passage the model has not seen at test time, so an objective
-      that can lower itself by fitting it is spending capacity on something that cannot
-      transfer.
+      computable from the question and answer alone. They differ in how much of the
+      answer <-> passage comparison reaches the classifier.
+    - **objective** -- `bce` against `within_question`, which centres each question's candidate
+      logits on their own mean and adds a pairwise ranking term (`PAIRWISE_WEIGHT`). The level
+      of a question is a property of a passage the model has not seen at test time, so an
+      objective that can lower itself by fitting it is spending capacity on something that
+      cannot transfer.
+    - **the knobs the factorial holds fixed** -- `head_only` (passage truncation),
+      `passage_no_gru`, `qa_gathers_only` (cross-attention direction), `qa_pool_full`,
+      `more_dropout`, `loss_no_pairwise` and `no_match_features`.
 
-    Every run in both grids registers in `experiments`/`models`/`test_loaders`, so the plots,
+    Every run in the study registers in `experiments`/`models`/`test_loaders`, so the plots,
     the sample-answer cell, the attention figures and the summary table pick them up, and each
-    run is cached to `ABLATION_CACHE_DIR` as it finishes, so an interrupted grid resumes.
+    run is cached to `ABLATION_CACHE_DIR` as it finishes, so an interrupted study resumes.
 
-    24 architectures x `len(ABLATION_SEEDS)` runs plus 7 x `len(ABLATION_SEEDS)` component runs,
-    each at most `ABLATION_EPOCHS` epochs (early stopping usually ends them before the budget).
-    Trim `ABLATION_SEEDS`, `POOLING_OPTIONS` or `ATTENTION_OPTIONS` if the budget is tight.
+    `len(ENCODER_OPTIONS)`-derived architectures x `len(ABLATION_SEEDS)` runs plus
+    `len(COMPONENT_VARIANTS)` x `len(ABLATION_SEEDS)` component runs, each at most
+    `ABLATION_EPOCHS` epochs (early stopping usually ends them before the budget). Trim
+    `ABLATION_SEEDS`, `POOLING_OPTIONS`, `ATTENTION_OPTIONS` or `COMPONENT_VARIANTS` if the
+    budget is tight.
     """)
     return
+
+
+@app.cell
+def ablation_components(
+    HEAD,
+    HEAD_OPTIONS,
+    LOSS,
+    LOSS_OPTIONS,
+    PASSAGE_TRUNCATION,
+    build_loaders,
+    test_loader,
+    train_loader,
+    val_loader,
+):
+    # --- Ablation components: the one-change-at-a-time variants --------------------------
+    # Each entry changes exactly ONE thing about the configured model, so a difference is
+    # attributable to that change. This list is the single source of truth for both studies in
+    # this section, so the quick screen and the final study can never drift apart:
+    #
+    #   quick_ablation  (QUICK_ABLATION)      shortened budget, 1 seed    -> a screen, not a result
+    #   final_ablation  (RUN_ABLATION_STUDY)  full budget x ABLATION_SEEDS -> the reported study
+    #
+    # The final study runs the architecture factorial (encoder x attention x pooling, which
+    # interact, so they are swept as a cross product) plus every COMPONENT_VARIANTS entry.
+    # GRID_AXIS_VARIANTS are screened by the quick study but not re-run at full budget: the
+    # factorial covers those three axes far more thoroughly than a one-change-at-a-time walk.
+    REFERENCE_VARIANT = ("reference", {})
+
+    # The axes the architecture factorial already sweeps; the quick screen walks them singly.
+    GRID_AXIS_VARIANTS = [
+        ("attention_self", {"attention": "self"}),
+        ("attention_inter", {"attention": "inter"}),
+        ("attention_none", {"attention": "none"}),
+        ("pool_mean", {"pooling": "mean"}),
+        ("pool_max", {"pooling": "max"}),
+        ("pool_final", {"pooling": "final"}),
+        # "single" cannot do cross-/inter-attention, so this pair is the encoder compared at
+        # equal attention (self) -- otherwise its effect would be confounded with attention.
+        ("single_encoder", {"encoder": "single", "attention": "self"}),
+    ]
+
+    # Everything the architecture factorial holds fixed. These are the components the FINAL
+    # study reports at full budget, one change at a time against the configured model -- which
+    # is itself a row of the architecture factorial, so the reference is already trained and
+    # the comparison is paired seed by seed.
+    COMPONENT_VARIANTS = (
+        # head: what the classifier is fed (every HEAD_OPTIONS value but the configured one)
+        [("head_" + _h, {"head": _h}) for _h in HEAD_OPTIONS if _h != HEAD]
+        # objective
+        + [("loss_" + _l, {"loss": _l}) for _l in LOSS_OPTIONS if _l != LOSS]
+        # the knobs the factorial never varies
+        + [
+            ("head_only", {"truncation": "head"}),
+            ("passage_no_gru", {"passage_encoder": "none"}),
+            ("qa_gathers_only", {"cross_direction": "qa_to_passage"}),
+            ("qa_pool_full", {"qa_pooling": "full"}),
+            ("more_dropout", {"dropout": 0.4}),
+            ("loss_no_pairwise", {"pairwise_weight": 0.0}),
+            ("no_match_features", {"head": "interaction", "match_features": False}),
+            # Model capacity. Both levers are trained from scratch on ~22k instances and
+            # the embedding table alone is vocab x d_model, so neither is an obvious win --
+            # which is exactly why they are swept rather than guessed at. Note the frozen-
+            # embedding baselines run at d_model=300, so a *capacity* difference against
+            # them is already confounded by design (and said so in the baselines cell).
+            ("d_model_256", {"d_model": 256}),
+            ("num_layers_2", {"num_layers": 2}),
+        ]
+    )
+
+    # The quick screen walks the reference, then the grid axes, then the components.
+    SCREEN_VARIANTS = [REFERENCE_VARIANT] + GRID_AXIS_VARIANTS + COMPONENT_VARIANTS
+
+    # Which override keys build the network, and which configure training. Anything else (the
+    # passage truncation, say) is not a create_model/train_model keyword and is handled by the
+    # caller -- including making sure it reaches the run's fingerprint.
+    _MODEL_KEYS = ("encoder", "attention", "pooling", "qa_pooling", "passage_encoder",
+                   "cross_direction", "head", "d_model", "num_heads", "num_layers",
+                   "dropout", "match_features")
+
+
+    def split_variant(override):
+        """(model kwargs, training kwargs) for one variant's override dict."""
+        model_over = {_k: _v for _k, _v in override.items() if _k in _MODEL_KEYS}
+        train_over = {_k: _v for _k, _v in override.items()
+                      if _k not in _MODEL_KEYS and _k != "truncation"}
+        return model_over, train_over
+
+
+    def variant_truncation(override):
+        """The passage truncation one variant is encoded under."""
+        return override.get("truncation", PASSAGE_TRUNCATION)
+
+
+    def loaders_for_truncation(truncation):
+        """(train, val, test) loaders for a truncation mode; the shared three where possible."""
+        if truncation == PASSAGE_TRUNCATION:
+            return train_loader, val_loader, test_loader
+        _train_ds, _val_ds, _test_ds, _train_ld, _val_ld, _test_ld = build_loaders(truncation)
+        return _train_ld, _val_ld, _test_ld
+
+
+    return (
+        COMPONENT_VARIANTS,
+        SCREEN_VARIANTS,
+        loaders_for_truncation,
+        split_variant,
+        variant_truncation,
+    )
 
 
 @app.cell
 def quick_ablation(
     ABLATION_CACHE_DIR,
     EARLY_STOPPING,
-    PASSAGE_TRUNCATION,
     QUICK_ABLATION,
     QUICK_ABLATION_EPOCHS,
-    build_loaders,
+    SCREEN_VARIANTS,
     create_model,
     experiments,
     load_saved_run,
+    loaders_for_truncation,
     models,
     run_fingerprint,
     save_run,
     saved_run_labels,
-    test_loader,
+    split_variant,
     test_loaders,
-    train_loader,
     train_model,
-    val_loader,
+    variant_truncation,
 ):
-    # --- Targeted quick ablation -------------------------------------------------
-    # A screen, not a result: one run per value of every axis the final grid sweeps (encoder,
-    # attention, pooling, head, objective) *plus* the knobs the grid never varies (passage
-    # truncation, the passage encoder, the cross-attention direction, question/answer pooling,
-    # dropout, the pairwise weight, the alignment-features channel). Each entry changes one
-    # thing relative to the configured model, so a difference is attributable to that change.
-    # It runs on a shortened budget (QUICK_ABLATION_EPOCHS): use it to see which variants
-    # deserve a full-budget run and which are dead on arrival.
+    # --- The quick screen (QUICK_ABLATION) -----------------------------------------------
+    # A screen, not a result. One run per entry of SCREEN_VARIANTS (see the
+    # `ablation_components` cell) on a shortened budget (QUICK_ABLATION_EPOCHS) and a single
+    # seed: use it to see which variants deserve a full-budget run and which are dead on
+    # arrival. The reported numbers come from the final study (`final_ablation`, gated on
+    # RUN_ABLATION_STUDY), which runs the same components at the full budget over ABLATION_SEEDS.
     #
     # It carries its own reference row, `q/reference`: the configured model re-trained at the
-    # screen budget, so each variant is compared against a model with as many epochs available
-    # as it has, rather than against section 3's full-budget run. `q/single_encoder` and
-    # `q/attention_self` are one change apart (the encoder) -- "single" cannot do
-    # cross-attention, so without that pair the encoder's effect would be confounded with the
-    # attention mechanism.
+    # screen budget, so each variant is compared against a model that had as many epochs
+    # available as it did, rather than against section 3's full-budget run.
     #
     # Every finished variant is written to ABLATION_CACHE_DIR as it goes, so a crash costs the
     # run in flight and re-running this cell picks up where it left off. Runs are tagged
-    # `kind="screen"` and register in experiments/models/test_loaders like the grid, so the
-    # plots pick them up -- but the reported tables, the diagnostics and the model-vs-baselines
-    # comparison leave them out, because a shortened-budget, single-seed run is not a result. A
-    # variant that changes `truncation` re-encodes through `build_loaders`, so it is scored on
-    # its own test loader.
-    #
-    # Set QUICK_ABLATION = True in the hyperparameters cell to run it.
+    # kind="screen" and register in experiments/models/test_loaders so the plots pick them up
+    # -- but the reported tables, the diagnostics and the model-vs-baselines comparison leave
+    # them out, because a shortened-budget, single-seed run is not a result. A variant that
+    # changes `truncation` re-encodes through `build_loaders`, so it is scored on its own
+    # test loader.
     if QUICK_ABLATION:
         def _screen_fingerprint(_model_over, _train_over, _override):
             """What a stored screen run must have been trained under to be reusable.
 
-            The same shared list the grid fingerprints with, at this screen's budget,
-            plus the raw variant dict -- so the settings a variant only implies (the
-            passage truncation) are part of the check too, and neither editing a
-            hyperparameter nor editing the variant list can reuse a stale run.
+            The same shared list the final study fingerprints with, at this screen's budget,
+            plus the raw variant dict -- so the settings a variant only implies (the passage
+            truncation) are part of the check too, and neither editing a hyperparameter nor
+            editing the variant list can reuse a stale run.
             """
             return run_fingerprint(QUICK_ABLATION_EPOCHS, _model_over, _train_over,
                                    overrides=_override)
 
-        # One entry per value of every grid axis, then the knobs the grid holds fixed.
-        _variants = [
-            # The budget-matched reference: no override, i.e. the configured model.
-            ("q/reference", {}),
-            # --- axes the final grid sweeps ---
-            ("q/attention_self", {"attention": "self"}),
-            ("q/attention_inter", {"attention": "inter"}),
-            ("q/attention_none", {"attention": "none"}),
-            ("q/pool_mean", {"pooling": "mean"}),
-            ("q/pool_max", {"pooling": "max"}),
-            ("q/pool_final", {"pooling": "final"}),
-            ("q/single_encoder", {"encoder": "single", "attention": "self"}),
-            ("q/head_concat", {"head": "concat"}),
-            ("q/head_compare", {"head": "compare"}),
-            ("q/head_match", {"head": "match"}),
-            ("q/loss_bce", {"loss": "bce"}),
-            # --- knobs the grid holds fixed ---
-            ("q/head_only", {"truncation": "head"}),
-            ("q/passage_no_gru", {"passage_encoder": "none"}),
-            ("q/qa_gathers_only", {"cross_direction": "qa_to_passage"}),
-            ("q/qa_pool_full", {"qa_pooling": "full"}),
-            # Regularisation check: does more dropout move the plateau, or is the ranking at
-            # this representation's ceiling?
-            ("q/more_dropout", {"dropout": 0.4}),
-            ("q/loss_no_pairwise", {"pairwise_weight": 0.0}),
-            ("q/no_match_features", {"head": "interaction", "match_features": False}),
-        ]
-
-        _already_stored = set(saved_run_labels()) & {_label for _label, _ in _variants}
+        _screen_labels = [f"q/{_name}" for _name, _ in SCREEN_VARIANTS]
+        _already_stored = set(saved_run_labels()) & set(_screen_labels)
         if _already_stored:
-            print(f"resume: {len(_already_stored)} of {len(_variants)} screen run(s) are "
+            print(f"resume: {len(_already_stored)} of {len(_screen_labels)} screen run(s) are "
                   f"already stored under {ABLATION_CACHE_DIR}/ and will be read back rather "
                   f"than retrained; a crash costs only the run in flight.")
 
-        for _label, _override in _variants:
+        for _name, _override in SCREEN_VARIANTS:
+            _label = f"q/{_name}"
             if _label in experiments:
                 print(f"{_label}: already in experiments, skipping")
                 continue
 
-            _truncation = _override.get("truncation", PASSAGE_TRUNCATION)
-            if _truncation == PASSAGE_TRUNCATION:
-                _train_ld, _val_ld, _test_ld = train_loader, val_loader, test_loader
-            else:
-                _, _, _, _train_ld, _val_ld, _test_ld = build_loaders(_truncation)
-
-            # Model arguments build the network; the rest are training arguments, so a variant
-            # can change either while still changing exactly one thing.
-            _model_keys = ("encoder", "attention", "pooling", "qa_pooling", "passage_encoder",
-                           "cross_direction", "head", "d_model", "num_heads", "num_layers",
-                           "dropout", "match_features")
-            _model_over = {_k: _v for _k, _v in _override.items() if _k in _model_keys}
-            _train_over = {_k: _v for _k, _v in _override.items()
-                           if _k not in _model_keys and _k != "truncation"}
-            _fingerprint_now = _screen_fingerprint(_model_over, _train_over,
-                                                   _override)
+            _truncation = variant_truncation(_override)
+            _train_ld, _val_ld, _test_ld = loaders_for_truncation(_truncation)
+            _model_over, _train_over = split_variant(_override)
+            _fingerprint_now = _screen_fingerprint(_model_over, _train_over, _override)
 
             # Resume: a variant stored by an earlier run of this cell is read back rather than
             # retrained, so a crash mid-screen costs one variant and not all of them.
@@ -4052,63 +4273,72 @@ def quick_ablation(
                   f"AP={_history['best_val_ap']:.4f} "
                   f"qF1@{_history['threshold']:.2f}={_history['threshold_q_f1']:.4f}")
 
-        print("\nRe-run the plots cell to include these runs, then send the survivors through "
-              "the full grid below at the full NUM_EPOCHS. These rows are tagged "
-              "kind='screen': the plots show them, the reported tables and the "
-              "model-vs-baselines comparison do not.")
-
+        print("\nThis is a screen: every row above is tagged kind='screen' and no reported "
+              "table reads them. Re-run the plots cell to include them, then run the final "
+              "study (`final_ablation`) for the numbers the report uses.")
     return
 
 
 @app.cell
-def _(
+def final_ablation(
     ABLATION_CACHE_DIR,
     ABLATION_EPOCHS,
     ABLATION_SEEDS,
-    ATTENTION,
     ATTENTION_OPTIONS,
+    COMPONENT_VARIANTS,
     EARLY_STOPPING,
     EARLY_STOP_METRIC,
     EARLY_STOP_PATIENCE,
-    ENCODER,
     ENCODER_OPTIONS,
     HEAD,
-    HEAD_OPTIONS,
     LOSS,
-    LOSS_OPTIONS,
     MATCH_FEATURES,
     PAIRWISE_WEIGHT,
     PASSAGE_TRUNCATION,
-    POOLING,
     POOLING_OPTIONS,
     RUN_ABLATION_STUDY,
-    RUN_COMPONENT_ABLATION,
     create_model,
     experiments,
     load_saved_run,
+    loaders_for_truncation,
     models,
     run_fingerprint,
     run_label,
     save_run,
     saved_run_labels,
-    test_loader,
+    split_variant,
     test_loaders,
-    train_loader,
     train_model,
-    val_loader,
     variant_tag,
+    variant_truncation,
 ):
-    # Section 4, final grid. Every (encoder, attention, pooling) configuration, repeated over
-    # ABLATION_SEEDS, under the same schedule, checkpoint rule and stopping rule. Seeds are
-    # the *outer* loop, so the grid is readable after one pass, and every finished run is
-    # cached under ABLATION_CACHE_DIR (history + weights) so an interrupted grid resumes. A
-    # cached run is reused only if the settings it was trained under still match.
+    # --- Section 4: the FINAL study (RUN_ABLATION_STUDY) ----------------------------------
+    # The reported, controlled ablation: two blocks, one budget, one stopping rule, run over
+    # ABLATION_SEEDS seeds each.
     #
-    # The architecture axis is swept under the configured HEAD, and HEAD has to keep the
-    # pooled vectors in the classifier for the POOLING axis to be measurable: head="match"
-    # feeds the classifier only the alignment features, so every pooling setting would build
-    # the same function (mean/max/final identical, attention pooling different only in its
+    #   1. the architecture factorial -- ENCODER_OPTIONS x ATTENTION_OPTIONS x POOLING_OPTIONS.
+    #      These three interact (cross-/inter-attention need two towers; pooling only reaches
+    #      the classifier under a head that reads the pooled vectors), so they are swept as a
+    #      cross product rather than one change at a time.
+    #   2. the component runs -- one change at a time against the configured model, covering
+    #      every COMPONENT_VARIANTS entry from the `ablation_components` cell: the head, the
+    #      objective, the passage truncation, the passage encoder, the cross-attention
+    #      direction, the question/answer pooling, dropout, the pairwise weight and the
+    #      alignment features.
+    #
+    # The configured model is a member of block 1, so the component runs need no reference of
+    # their own: it is already trained at every seed, and the comparison is paired seed by
+    # seed -- the sensitive test the diagnostics cell prints.
+    #
+    # The architecture axis is swept under the configured HEAD, and HEAD has to keep the pooled
+    # vectors in the classifier for the POOLING axis to be measurable: head="match" feeds the
+    # classifier only the alignment features, so every pooling setting would build the same
+    # function (mean/max/final identical, attention pooling different only in its
     # initialisation). The guard below refuses that combination by name.
+    #
+    # Seeds are the *outer* loop, so the study is readable after one pass, and every finished
+    # run is cached under ABLATION_CACHE_DIR (history + weights) so an interrupted study
+    # resumes. A cached run is reused only if the settings it was trained under still match.
     if RUN_ABLATION_STUDY:
         import time as _time
 
@@ -4122,15 +4352,19 @@ def _(
                 "'interaction', 'compare' or 'concat' to sweep pooling, or take "
                 "POOLING_OPTIONS out of this grid.")
 
-        def _fingerprint(_model_kwargs=None, _train_kwargs=None):
+        def _fingerprint(_model_kwargs=None, _train_kwargs=None, _overrides=None):
             """The settings a stored run must still match to be comparable.
 
-            The list itself is shared with the quick-ablation screen and lives in the
-            persistence cell (`run_fingerprint`); this only supplies this grid's budget.
+            The list itself is shared with the quick screen and lives in the persistence cell
+            (`run_fingerprint`); this only supplies this study's budget. `_overrides` carries
+            the raw variant dict for a component run, so a setting that is not a
+            `create_model`/`train_model` keyword at all -- the passage truncation, say -- is
+            still part of the check.
             """
-            return run_fingerprint(ABLATION_EPOCHS, _model_kwargs, _train_kwargs)
+            return run_fingerprint(ABLATION_EPOCHS, _model_kwargs, _train_kwargs,
+                                   overrides=_overrides)
 
-        def _load_cached(label, model_kwargs, train_kwargs):
+        def _load_cached(label, model_kwargs, train_kwargs, overrides=None):
             """A finished run read back from the store, or None if it has to be retrained.
 
             The store and its layout live in the persistence cell (`save_run`,
@@ -4141,17 +4375,18 @@ def _(
             if _stored is None:
                 return None
             _history, _model, _stored_fingerprint = _stored
-            if _stored_fingerprint != _fingerprint(model_kwargs, train_kwargs):
+            if _stored_fingerprint != _fingerprint(model_kwargs, train_kwargs, overrides):
                 print(f"  [{label}] stored run ignored: the settings changed since it "
                       f"was trained")
                 return None
             return _history, _model
 
-        def _save_cached(label, history, model, model_kwargs, train_kwargs):
+        def _save_cached(label, history, model, model_kwargs, train_kwargs, overrides=None):
             """Store one finished run, so a crash costs only the run in flight."""
             save_run(label, model, history, model_kwargs, train_kwargs,
-                     fingerprint=_fingerprint(model_kwargs, train_kwargs))
+                     fingerprint=_fingerprint(model_kwargs, train_kwargs, overrides))
 
+        # --- block 1: the architecture factorial (every configuration the encoder admits) ---
         _configs = []
         for _encoder in ENCODER_OPTIONS:
             for _attention in ATTENTION_OPTIONS:
@@ -4160,9 +4395,9 @@ def _(
                 for _pooling in POOLING_OPTIONS:
                     _configs.append((_encoder, _attention, _pooling))
 
-        # Seeds outermost: after one pass every configuration has a comparable number. Each
-        # entry is (run label, config label, seed, model kwargs, training kwargs), so both
-        # grids below share one cache, one progress estimate and one loop.
+        # Each entry is (run label, config label shown in the table, seed, model kwargs,
+        # training kwargs, passage truncation, raw override dict for the fingerprint), so both
+        # blocks share one cache, one progress estimate and one loop.
         _planned = []
         for _seed in ABLATION_SEEDS:
             for (_encoder, _attention, _pooling) in _configs:
@@ -4172,33 +4407,29 @@ def _(
                      run_label(_encoder, _attention, _pooling, variant=_tag), _seed,
                      {"encoder": _encoder, "attention": _attention, "pooling": _pooling,
                       "head": HEAD, "match_features": MATCH_FEATURES, "seed": _seed},
-                     {"loss": LOSS, "pairwise_weight": PAIRWISE_WEIGHT}))
-            if RUN_COMPONENT_ABLATION:
-                # Head x objective, architecture held at the configured trio. The configured
-                # cell of that 2x2 is already planned above, so only the other three are added.
-                for _head in HEAD_OPTIONS:
-                    for _loss in LOSS_OPTIONS:
-                        if (_head, _loss) == (HEAD, LOSS):
-                            continue
-                        _tag = variant_tag(head=_head, loss=_loss)
-                        _planned.append(
-                            (run_label(ENCODER, ATTENTION, POOLING, _seed, variant=_tag),
-                             run_label(ENCODER, ATTENTION, POOLING, variant=_tag), _seed,
-                             {"encoder": ENCODER, "attention": ATTENTION,
-                              "pooling": POOLING, "head": _head,
-                              "match_features": MATCH_FEATURES, "seed": _seed},
-                             {"loss": _loss, "pairwise_weight": PAIRWISE_WEIGHT}))
+                     {"loss": LOSS, "pairwise_weight": PAIRWISE_WEIGHT},
+                     PASSAGE_TRUNCATION, None))
+
+            # --- block 2: the component runs, one change at a time off the configured model ---
+            for _name, _override in COMPONENT_VARIANTS:
+                _model_over, _train_over = split_variant(_override)
+                _planned.append(
+                    (f"component/{_name}/s{_seed}", f"component/{_name}", _seed,
+                     {**_model_over, "seed": _seed}, _train_over,
+                     variant_truncation(_override), _override))
 
         _architecture_runs = len(_configs) * len(ABLATION_SEEDS)
-        _missing = [lab for lab, _, _, _, _ in _planned if lab not in experiments]
-        print(f"{len(_configs)} architectures x {len(ABLATION_SEEDS)} seeds = "
-              f"{_architecture_runs} runs, plus {len(_planned) - _architecture_runs} "
-              f"head x objective runs = {len(_planned)} total; {len(_missing)} not in memory, "
-              f"up to {ABLATION_EPOCHS} epochs each, early stopping "
+        _component_runs = len(COMPONENT_VARIANTS) * len(ABLATION_SEEDS)
+        _missing = sum(1 for _p in _planned if _p[0] not in experiments)
+        print(f"{len(_configs)} architectures + {len(COMPONENT_VARIANTS)} components = "
+              f"{len(_configs) + len(COMPONENT_VARIANTS)} configurations x "
+              f"{len(ABLATION_SEEDS)} seeds = {_architecture_runs + _component_runs} runs "
+              f"({_architecture_runs} architecture, {_component_runs} component); "
+              f"{_missing} not in memory, up to {ABLATION_EPOCHS} epochs each, early stopping "
               f"{'on' if EARLY_STOPPING else 'off'} "
               f"(patience {EARLY_STOP_PATIENCE} on {EARLY_STOP_METRIC})")
 
-        _planned_labels = {_label for _label, _, _, _, _ in _planned}
+        _planned_labels = {_p[0] for _p in _planned}
         _already_stored = _planned_labels & set(saved_run_labels())
         if _already_stored:
             print(f"resume: {len(_already_stored)} of {len(_planned_labels)} planned run(s) "
@@ -4212,12 +4443,17 @@ def _(
 
         _trained = _reused = 0
         _elapsed = 0.0
-        for _label, _run_config, _seed, _model_kwargs, _train_kwargs in _planned:
+        for (_label, _run_config, _seed, _model_kwargs, _train_kwargs, _truncation,
+             _overrides) in _planned:
             if _label in experiments:
                 _reused += 1
                 continue
 
-            _cached = _load_cached(_label, _model_kwargs, _train_kwargs)
+            # A component run that changes `truncation` is encoded differently, so it gets its
+            # own loaders; everything else shares the notebook's three.
+            _train_ld, _val_ld, _test_ld = loaders_for_truncation(_truncation)
+
+            _cached = _load_cached(_label, _model_kwargs, _train_kwargs, _overrides)
             if _cached is not None:
                 _history, _model = _cached
                 print(f"{_label}: read back from {ABLATION_CACHE_DIR} "
@@ -4226,18 +4462,18 @@ def _(
             else:
                 print("=" * 60)
                 print(f"{_label}  (budget {ABLATION_EPOCHS} epochs, seed {_seed}, "
-                      f"head={_model_kwargs['head']}, "
-                      f"loss={_train_kwargs.get('loss', LOSS)})")
+                      f"config {_run_config}, truncation={_truncation})")
                 print("=" * 60)
                 _t0 = _time.time()
                 _model = create_model(**_model_kwargs)
-                _history = train_model(_model, train_loader, val_loader,
+                _history = train_model(_model, _train_ld, _val_ld,
                                        num_epochs=ABLATION_EPOCHS, label=_label,
                                        seed=_seed, early_stopping=EARLY_STOPPING,
                                        **_train_kwargs)
-                _history["truncation"] = PASSAGE_TRUNCATION
+                _history["truncation"] = _truncation
                 _history["config"] = _run_config
-                _save_cached(_label, _history, _model, _model_kwargs, _train_kwargs)
+                _save_cached(_label, _history, _model, _model_kwargs, _train_kwargs,
+                             _overrides)
                 _elapsed += _time.time() - _t0
                 _trained += 1
                 print(f"  {_label}: best epoch {_history['best_epoch']} of "
@@ -4249,20 +4485,20 @@ def _(
 
             # A run cached from a different export may lack the bookkeeping keys; fill them
             # rather than failing, so the plots and the summary can read every row.
-            _history["truncation"] = _history.get("truncation") or PASSAGE_TRUNCATION
+            _history["truncation"] = _history.get("truncation") or _truncation
             _history["config"] = _history.get("config") or _run_config
             experiments[_label] = _history
             models[_label] = _model
-            test_loaders[_label] = test_loader
+            test_loaders[_label] = _test_ld
 
-            _still = sum(1 for _l, _, _, _, _ in _planned if _l not in experiments)
+            _still = sum(1 for _p in _planned if _p[0] not in experiments)
             if _trained and _still:
                 _per = _elapsed / _trained
                 print(f"  [progress] {_trained} trained in this cell at "
                       f"~{_per:.0f}s each (cached runs are free); {_still} run(s) left, "
                       f"~{_per * _still / 60:.0f} min at that rate")
 
-        print(f"\nGrid done: {_trained} trained, {_reused} already in memory. "
+        print(f"\nStudy done: {_trained} trained, {_reused} already in memory. "
               f"Re-run the plots cell, then the summary table.")
     return
 
