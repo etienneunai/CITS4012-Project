@@ -173,13 +173,13 @@ def hyperparameters():
     #                          alignment features). The component list is in the
     #                          `ablation_components` cell; both studies read it, so the
     #                          screen and the final study can never drift apart.
-    RUN_ABLATION_STUDY = False
+    RUN_ABLATION_STUDY = True
     ENCODER_OPTIONS = ["two_tower", "single"]
     ATTENTION_OPTIONS = ["self", "cross", "inter", "none"]
     POOLING_OPTIONS = ["final", "mean", "max", "attention"]
 
     # The quick screen, and its shortened budget. A screen, not a result.
-    QUICK_ABLATION = True
+    QUICK_ABLATION = False
     QUICK_ABLATION_EPOCHS = 8
 
     # --- Section 4: the final study's budget and seeds ---
@@ -233,7 +233,7 @@ def hyperparameters():
     # export is part of the saved workspace and survives closing and reopening the notebook.
     RESULTS_DIR = _os.path.join(_NOTEBOOK_DIR, "results_export")
     SAVE_RESULTS = True
-    LOAD_RESULTS = False
+    LOAD_RESULTS = True
     return (
         ABLATION_CACHE_DIR,
         ABLATION_EPOCHS,
@@ -1983,6 +1983,7 @@ def results_io(
     # model rebuilds exactly and a stale export is refused instead of silently scoring wrong.
     import json as _json
     import os as _os
+    import re as _re
 
     _MANIFEST = "manifest.json"
     _EXPERIMENTS_FILE = "experiments.json"
@@ -1998,13 +1999,39 @@ def results_io(
             return str(value)
 
 
+    def _gru_layers(model):
+        """Stacked BiGRU layers `model` was built with, read off its recurrent module.
+
+        Every encoder keeps one -- `qa_gru` for the two-tower model, `joint_gru` for the single
+        one -- and `nn.GRU` stores the depth on the module, so this is the model's own answer
+        rather than the notebook-wide `NUM_LAYERS`. The two differ for exactly the runs that
+        override it (`num_layers_2` in the ablation components), and the difference is not
+        cosmetic: a second layer names its parameters `*_l1`, so a spec that disagreed with the
+        weights could not even be loaded.
+        """
+        for _name in ("passage_gru", "qa_gru", "joint_gru"):
+            _gru = getattr(model, _name, None)
+            if _gru is not None:
+                return int(_gru.num_layers)
+        raise AttributeError(
+            "model has no recurrent module (passage_gru / qa_gru / joint_gru), so the depth it "
+            "was built at cannot be read off it")
+
+
     def _model_spec(model):
         """Constructor arguments that rebuild `model` exactly.
 
-        Read off the object, so the export stays valid if the hyperparameters cell is edited
-        later; `num_heads`, `num_layers` and `dropout` are notebook-wide, so they come from
-        those.
+        Read off the object rather than off the hyperparameters cell, so the export stays valid
+        if that cell is edited later *and* so a run that overrode a notebook-wide default is
+        recorded as it was trained: `num_layers` and `dropout` are both overridden by
+        `COMPONENT_VARIANTS`, and both are read back off the model (`num_layers` from the GRU,
+        `dropout` from the classifier's `nn.Dropout`). `num_heads` is the one argument no
+        attribute reveals on every configuration -- `attention="none"` builds no attention
+        module at all -- so it falls back to the notebook-wide `NUM_HEADS`, which is also what
+        every configuration here trains under.
         """
+        _heads = next((int(_module.num_heads) for _module in model.modules()
+                       if hasattr(_module, "num_heads")), NUM_HEADS)
         return {
             "encoder": model.encoder_name,
             "attention": model.attention_name,
@@ -2015,9 +2042,9 @@ def results_io(
             "head": model.head_name,
             "match_features": bool(model.match_features),
             "d_model": int(model.embedding.embedding_dim),
-            "num_heads": NUM_HEADS,
-            "num_layers": NUM_LAYERS,
-            "dropout": DROPOUT,
+            "num_heads": _heads,
+            "num_layers": _gru_layers(model),
+            "dropout": float(model.dropout.p),
         }
 
 
@@ -2112,6 +2139,52 @@ def results_io(
         return baseline_results, baseline_errors
 
 
+    # --- Reconciling a recorded spec with the weights it was trained at ------------------
+    # `_model_spec` reads the constructor arguments off the model, so a fresh export always
+    # agrees with its weights. An export written before it did -- or one edited by hand -- can
+    # disagree, and the one field that cannot be wrong quietly is `num_layers`: `nn.GRU` numbers
+    # a second layer's parameters `*_l1`, so a recorded depth that is too shallow does not
+    # degrade the model, it fails `load_state_dict` on those very keys and takes the whole
+    # export's load down with it, whatever else the export holds. Depth is also the one field a
+    # weights file pins down exactly, so it is read back off the weights rather than taken on
+    # trust. Nothing else is corrected, because nothing else is recoverable from a weights file
+    # and a guess would score wrong.
+    _GRU_LAYER_RE = _re.compile(r"_(?:ih|hh)_l(\d+)(?:_reverse)?$")
+
+
+    def _weights_layers(state_dict):
+        """Stacked recurrent layers a weights file holds, or None if it holds no GRU.
+
+        `nn.GRU` names layer 2's parameters `weight_ih_l1` / `weight_hh_l1` (`..._l1_reverse`
+        for the backward direction), so the highest index in the file is the depth the run was
+        built at -- read off the names, not inferred from anything.
+        """
+        _depths = [int(_match.group(1)) + 1 for _key in state_dict
+                   if (_match := _GRU_LAYER_RE.search(_key))]
+        return max(_depths) if _depths else None
+
+
+    def _spec_matching_weights(label, spec, state_dict):
+        """`spec` with `num_layers` taken from `state_dict` where the two disagree.
+
+        The mismatch is a stale manifest field, not a broken run: those weights are the trained
+        model and they rebuild cleanly at the depth they actually hold, so the depth is corrected
+        to it -- and reported, because a silently wrong architecture is exactly what the
+        manifest exists to prevent. The other direction matters too: loading the recorded depth
+        would either raise (`*_l1` keys unexpected) or, at `strict=False`, quietly drop the extra
+        layer's trained weights. Re-exporting (SAVE_RESULTS, from the loaded models) rewrites the
+        manifest to agree.
+        """
+        _recorded, _actual = spec.get("num_layers"), _weights_layers(state_dict)
+        if _recorded is None or _actual is None or int(_recorded) == _actual:
+            return spec
+        print(f"  [load] {label}: the export records num_layers={_recorded}, but its weights "
+              f"hold {_actual} stacked GRU layer(s) (`*_l1` keys) -- so it was trained at depth "
+              f"{_actual} and the manifest field is the stale one. Rebuilding it at depth "
+              f"{_actual}; re-export with SAVE_RESULTS to fix the manifest.")
+        return dict(spec, num_layers=_actual)
+
+
     def load_runs(directory=RESULTS_DIR):
         """(experiments, models, test_loaders) from an export, with every model rebuilt.
 
@@ -2119,14 +2192,19 @@ def results_io(
         plots, the sample-answer cell, the attention figures and the summary table all work off
         a loaded export exactly as off a trained one. A run whose PASSAGE_TRUNCATION differs
         from the notebook default gets its own test loader rebuilt.
+
+        An argument the recorded spec and the weights disagree on is corrected only where the
+        weights pin it down (`num_layers`; see `_spec_matching_weights`) and said so out loud.
+        Anything else is left to raise rather than be loaded at the wrong size.
         """
         _manifest, experiments, _baselines, _errors = _read_export(directory)
         models, test_loaders, _loaders = {}, {}, {}
         for _label, _spec in _manifest["models"].items():
-            _model = create_model(**_spec)
-            _model.load_state_dict(torch.load(
+            _state = torch.load(
                 _os.path.join(directory, _WEIGHTS_DIR, _weights_name(_label)),
-                map_location=DEVICE))
+                map_location=DEVICE)
+            _model = create_model(**_spec_matching_weights(_label, _spec, _state))
+            _model.load_state_dict(_state)
             _model.eval()
             models[_label] = _model
             _trunc = (experiments.get(_label, {}).get("truncation")
